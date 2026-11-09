@@ -140,6 +140,18 @@ $Families = @(
     }
 )
 
+# A failed download writes its cause to the output and is tried once more.
+function Invoke-Download([string] $Url, [string] $OutFile) {
+    try {
+        Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing
+    }
+    catch {
+        Write-Host "Download of $Url failed: $($_.Exception.Message) Retrying in 3 s."
+        Start-Sleep -Seconds 3
+        Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing
+    }
+}
+
 function Get-VerifiedDownload([string] $Url, [string] $Sha256) {
     $name = [IO.Path]::GetFileName(([Uri] $Url).AbsolutePath)
     $folder = Join-Path $Cache ([IO.Path]::GetFileName([IO.Path]::GetDirectoryName(([Uri] $Url).AbsolutePath)))
@@ -150,7 +162,7 @@ function Get-VerifiedDownload([string] $Url, [string] $Sha256) {
     New-Item -ItemType Directory -Force $folder | Out-Null
     $partial = "$path.partial"
     Write-Host "Downloading $Url"
-    Invoke-WebRequest -Uri $Url -OutFile $partial -UseBasicParsing
+    Invoke-Download $Url $partial
     $actual = (Get-FileHash $partial -Algorithm SHA256).Hash
     if ($actual -ne $Sha256) {
         Remove-Item $partial

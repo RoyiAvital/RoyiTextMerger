@@ -1,21 +1,23 @@
-[![Visitors](https://api.visitorbadge.io/api/combined?path=https%3A%2F%2Fgithub.com%2FRoyiAvital%2FRoyiTextMerger&labelColor=%23f47373&countColor=%23555555&style=plastic)](https://github.com/RoyiAvital/RoyiTextMerger) <!-- https://www.visitorbadge.io -->
+[![Visitors](https://api.visitorbadge.io/api/combined?path=https%3A%2F%2Fgithub.com%2FRoyiAvital%2FStackExchangeCodes&labelColor=%23f47373&countColor=%23555555&style=plastic)](https://github.com/RoyiAvital/RoyiTextMerger) <!-- https://www.visitorbadge.io -->
+[![Documentation](https://img.shields.io/badge/documentation-online-brightgreen?style=plastic)](https://RoyiAvital.github.io/RoyiTextMerger)
 
 # Royi Text Merger
 
 `RoyiTextMerger` is a portable, keyboard workflow focused, lightweight and
-performance oriented Diff & Merge tool for a pair of text and code files.
+performance oriented Diff & Merge tool.
+
+> ![IMPORTANT]
+> The main use case is comparing and merging two text files initiated by a _File Manager_ or command line.
 
 It focuses on:
  - Two files side by side, aligned, with their changes marked.
  - Copying changes between the files.
- - **Commands** through the _Command Palette_ and a **keyboard** oriented workflow.
  - High performance to generate a **reactive** experience.
+ - **Commands** through the _Command Palette_ and a **keyboard** oriented workflow.
+ - Configuration of **Read Only** and **Diff** modes.
  - Developed and verified on **Windows OS**.
 
 Each pane edits and searches as [Royi Text Editor](https://github.com/RoyiAvital/RoyiTextEditor) does.
-
-The [documentation](https://RoyiAvital.github.io/RoyiTextMerger) describes
-comparing and merging, the keys and the settings.
 
 ## Installation
 
@@ -23,8 +25,13 @@ comparing and merging, the keys and the settings.
    [latest release](https://github.com/RoyiAvital/RoyiTextMerger/releases/latest).
 2. Extract it to a folder of your choice and run `RoyiTextMerger.exe`.
 
-It is portable: keep the extracted files together. Requirements: Windows 11,
-x64 CPU with AVX2.
+> [!TIP]
+> _RoyiTextMerger_ is portable. Keep the extracted files together and move the folder whenever needed.
+
+### Requirements
+
+- Windows 11.
+- x64 CPU with AVX2.
 
 ## Usage
 
@@ -54,6 +61,11 @@ divider copy a change with a click.
 | `Ctrl+K S`                         | Save All                                   |
 | Palette                            | Toggle Diff Mode                           |
 | Palette                            | Toggle Ignore Trim Whitespace              |
+
+> [!TIP]
+> _RoyiTextMerger_ can be integrated into [RoyiFileMananger](https://github.com/RoyiAvital/RoyiFileManager)'s workflow (The `Tools: Compare files` command).
+
+### Configuration
 
 `RoyiTextMerger.yaml` next to the executable sets the comparison (VS Code's
 defaults):

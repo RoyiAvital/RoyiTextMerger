@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.0]
 
 The first release: a Diff & Merge tool for a pair of text and code files, built
-on Royi Text Editor.
+on [_Royi Text Editor_](https://github.com/RoyiAvital/RoyiTextEditor).
 
 ### Added
 
