@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 3c154438ecdc015c015ecd53b6fd4286e84f39657d0106303ddc2df2df25daa8 # shrinks to (left, right) = ("\n\n\n\n\n\n\n\n\n\n\n\n{\nb\n    x\n\n\n\n\n\n\n\n\n\n\n    x", "\n\n\n\n\n\n\n\n\n\n\n\n{\nb\n    }\n    x\n\n\n\n\n\n\n\n\n\n"), trim = false

@@ -1,0 +1,8171 @@
+//! The editor window: input, view state, prompts and saving around a
+//! [`Document`], plus the command palette and panels drawn above it.
+
+mod code;
+mod compare;
+mod cursors;
+mod find;
+mod goto;
+mod lifecycle;
+mod merge;
+mod spell;
+
+use std::borrow::Cow;
+use std::cell::RefCell;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::mpsc::{Receiver, TryRecvError};
+
+use rtm_edit::{self as edit, Command, EditOptions, Selection, Selections};
+use rtm_platform::{App, Ctx, Dropped, Event, Key};
+use rtm_render::{Renderer, Target};
+use rtm_syntax::Lang;
+use rtm_text::{Encoding, LineEnding, Snapshot};
+use rtm_view::{
+    Arrows, CaretStyle, Cell, Chrome, DisplayList, Frame, Header, Highlights, Layout, Options,
+    PALETTE_ROWS, PaletteFrame, PaletteGeometry, PaletteRow, PanelFrame, PanelGeometry, PanelLine,
+    ROW_SCAN_LIMIT, Scroll, Side, SplitFrame, Theme, Tone, ViewBuilder, draw_palette, draw_panel,
+    hit_line,
+};
+use unicode_width::UnicodeWidthStr;
+
+use crate::bench;
+use crate::clip;
+use crate::commands::{
+    self, Action, COMMANDS, CommandDef, EDITING_KEYS, key_name, vk::*, works_without_file,
+};
+use crate::document::{Document, Journaled, Locks};
+use crate::favorites::{self, FileStorage, MAX_FAVORITES, Store};
+use crate::loader::{self, FileInfo, Load, LoadEvent, display_name};
+use crate::palette::{Item, Mode, Motion, Palette};
+use crate::save::{self, Baseline, FileOps, SaveOutcome, SaveRequest};
+use crate::search::SearchThread;
+use crate::spelling::SpellThread;
+use crate::syntax::{EarlySyntax, Syntax};
+use crate::trace::Trace;
+use crate::watcher::Watcher;
+
+use compare::Compare;
+pub use compare::DiffSettings;
+use cursors::Column;
+use find::{FindBox, PendingOp};
+
+/// Font size in pixels at 96 DPI and zoom 0.
+pub const BASE_PX: f32 = 14.0;
+const WHEEL_NOTCH: i32 = 120;
+const WHEEL_LINES: i32 = 3;
+const WHEEL_COLUMNS: i32 = 6;
+/// Columns kept visible beside the caret when scrolling horizontally.
+const REVEAL_MARGIN: u64 = 4;
+/// Selections up to this size show a character count.
+const COUNT_LIMIT: u64 = 64 * 1024;
+/// Shown in the body of the empty state.
+const EMPTY_HINT: &str = "Drop a file here to open it";
+/// On the status line while leading and trailing whitespace counts.
+const WHITESPACE_COMPARED: &str = "Whitespace compared";
+
+/// Wakes the window thread from worker threads.
+pub type Wake = Arc<dyn Fn() + Send + Sync>;
+
+/// What follows once unsaved changes are settled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Exit {
+    /// `Application: Quit` or the window close request.
+    Quit,
+    /// `File: Close`: back to the empty state.
+    CloseFile,
+}
+
+/// A dropped file loading while the current state stays: it replaces the
+/// current file only once its loader confirms it is a file.
+struct PendingOpen {
+    path: PathBuf,
+    load: Load,
+    /// Shown once the file is open.
+    notice: Option<String>,
+    /// A reload (`R`): opens despite unsaved changes, then restores the
+    /// scroll and the caret.
+    restore: Option<(Scroll, u64)>,
+}
+
+/// The watcher of the open file, started once it is loaded and shown.
+enum Watching {
+    Idle,
+    Running(Watcher),
+    /// No notifications, or a failed wait: started again after a save.
+    Ended,
+}
+
+enum LoadStatus {
+    Loading { loaded: u64, total: u64 },
+    Ready,
+    Failed(String),
+}
+
+pub struct Settings {
+    /// `--read-only`: the left pane's files open read-only.
+    pub read_only: bool,
+    /// `--diff-mode`: both panes start read-only.
+    pub diff_mode: bool,
+    pub exit_after_first_frame: bool,
+    pub exit_after_load: bool,
+    /// `--exit-after-highlight`: like `exit_after_load`, and a code file
+    /// also waits until it is highlighted from a parse of the whole file.
+    pub exit_after_highlight: bool,
+    /// Recent commands listed by `Ctrl+P` (configuration).
+    pub recent_count: usize,
+    /// Most cursors select-all may create (configuration).
+    pub multi_cursor_limit: usize,
+    /// Memory Replace All may use, in MiB (configuration).
+    pub replace_all_max_mib: u64,
+    /// Folder of the palette state file; `None` keeps it in memory.
+    pub user_dir: Option<PathBuf>,
+    /// Shown on the status line at startup (configuration problems).
+    pub notice: Option<String>,
+    /// `false` after `--syntax none` / `--syntax off`.
+    pub highlighting: bool,
+    /// `--syntax <id>`: language chosen instead of detection.
+    pub syntax: Option<String>,
+    /// Larger files are not highlighted (`syntax.maxFileMiB`).
+    pub syntax_max_mib: u64,
+    /// Embedded languages (`syntax.injections`).
+    pub injections: bool,
+    /// Spelling on at startup (`spelling.enabled`, `--spelling`).
+    pub spelling: bool,
+    pub spelling_engine: crate::spelling::Engine,
+    /// Base path of the Hunspell dictionary files.
+    pub hunspell: PathBuf,
+    /// Syntax thread started while loading (adopted once).
+    pub early_syntax: Option<EarlySyntax>,
+    /// Scripted keys of an interaction benchmark.
+    pub bench: Option<bench::Script>,
+    pub diff: DiffSettings,
+}
+
+/// Drawn above the text; takes the keyboard while open.
+enum Popup {
+    Palette(Box<Palette>),
+    Panel(Panel),
+}
+
+/// A read-only text panel (About, Keyboard Shortcuts).
+struct Panel {
+    title: &'static str,
+    footer: &'static str,
+    lines: Vec<PanelLine>,
+    /// URL opened by a click on each line.
+    links: Vec<Option<&'static str>>,
+    icon: bool,
+    /// First visible line.
+    first: usize,
+}
+
+/// A question shown in the status line until answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Prompt {
+    /// Unsaved changes, then what to do once they are saved or dropped.
+    DirtyClose(Exit),
+    /// The file changed on disk; `Baseline` is the version found there.
+    Changed(Baseline),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unit {
+    Char,
+    Word,
+    Line,
+}
+
+/// Mouse selection in progress: granularity and the range first clicked.
+#[derive(Clone, Copy, Debug)]
+struct Drag {
+    unit: Unit,
+    origin: (u64, u64),
+    mode: DragMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DragMode {
+    /// One selection replaces all others.
+    Single,
+    /// `Alt+Click`: the drag changes only the added (primary) selection.
+    Add,
+    /// `Shift+Alt` or middle-button drag from the anchor cell.
+    Column((u64, u64)),
+    /// The scroll slider, held `grab` pixels below its top.
+    Slider { grab: i32 },
+}
+
+/// Snapshot, caret, syntax generation and the bracket pair found there.
+type BracketPair = (Snapshot, u64, u64, Option<(u64, u64)>);
+
+/// Snapshot, tab width and (line start, scan end offset, its column) of
+/// long visible lines.
+type Seams = (Option<Snapshot>, u32, Vec<(u64, u64, u64)>);
+
+/// The disk state a queued save expects to replace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Queued {
+    /// `Ctrl+S`: the pane's baseline when the save starts.
+    Baseline,
+    /// Save Current in the Changed prompt: the version the user saw.
+    Disk(Baseline),
+}
+
+/// One pane: its file and everything that belongs to it (all that
+/// `reset_document` resets). The editor holds the focused pane in `pane`
+/// and the other one in `other`; per-file code works on `pane`, and
+/// [`Editor::with_other`] runs it for the other pane.
+struct Pane {
+    side: Side,
+    /// Index of the pane in session workers (the spelling lanes); unlike
+    /// `side`, Swap Sides keeps it.
+    slot: usize,
+    doc: Document,
+    path: Option<PathBuf>,
+    info: Option<FileInfo>,
+    baseline: Option<Baseline>,
+    title: String,
+    status: LoadStatus,
+    loads: Option<Load>,
+    /// A dropped file waiting for its loader's first answer.
+    pending: Option<PendingOpen>,
+    /// Syntax thread started while the command-line file loaded (adopted once).
+    early_syntax: Option<EarlySyntax>,
+    prompt: Option<Prompt>,
+    saving: Option<Receiver<SaveOutcome>>,
+    /// A save waits for the running one (of either pane).
+    save_queued: Option<Queued>,
+    /// The last save was refused (read-only file): the unsaved dot is orange.
+    save_refused: bool,
+    /// Column of the last queried caret: snapshot, offset, tab width, column.
+    caret_column: RefCell<Option<(Snapshot, u64, u32, u64)>>,
+    /// Scan ends of long visible lines for the snapshot and tab width.
+    seams: RefCell<Seams>,
+    /// Language of the document: detected, or chosen when `language_chosen`.
+    language: Option<&'static Lang>,
+    language_chosen: bool,
+    /// The syntax thread, while highlighting a language.
+    syntax: Option<Syntax>,
+    /// Highlighting is off because the text exceeds `syntax.maxFileMiB`.
+    syntax_over_limit: bool,
+    /// Go to Symbol waits for the syntax thread.
+    symbols_pending: bool,
+    /// Last bracket pair: snapshot, caret, syntax generation, pair.
+    bracket_cache: RefCell<Option<BracketPair>>,
+    /// The search box, created on first use.
+    find: Option<Box<FindBox>>,
+    /// The search thread, started on first use.
+    search: Option<SearchThread>,
+    /// Generation of operation requests (occurrences, replace, select all).
+    op_generation: u64,
+    pending_op: Option<PendingOp>,
+    /// Selections before cursor commands, for `Ctrl+U`.
+    cursor_history: std::collections::VecDeque<(Snapshot, Selections)>,
+    column: Option<Column>,
+    /// Word whose occurrences match whole words (`Ctrl+D` from a caret).
+    occurrence_word: Option<String>,
+    /// Selections before each Expand Selection, and the last result.
+    expansions: Vec<Selections>,
+    expanded: Option<Selections>,
+    /// Offsets of the symbols listed by Go to Symbol.
+    symbol_offsets: Vec<u64>,
+    /// Go to Line: the scroll before its preview, restored by `Escape`.
+    line_preview: Option<Scroll>,
+    /// Trace marks done: first highlighted frame, fully highlighted, first
+    /// complete spelling marks.
+    marked: (bool, bool, bool),
+    /// Spelling, started on first need while `spell_on`.
+    spell: Option<Box<spell::Spell>>,
+    /// Changes when the drawn spelling marks change.
+    spell_rev: u64,
+    watching: Watching,
+    /// The file on disk as last reported or written (`Some(None)`: absent);
+    /// `None` before the first report.
+    disk: Option<Option<rtm_platform::files::FileStamp>>,
+    /// The deletion notice was shown for the current disappearance.
+    deletion_shown: bool,
+    /// Scroll and caret restored when a reload is loaded.
+    restore: Option<(Scroll, u64)>,
+}
+
+impl Pane {
+    /// A pane on `path` (empty without one) with its edit locks; `loading`
+    /// while a loader reads the file.
+    fn new(side: Side, path: Option<&Path>, locks: Locks, loading: bool) -> Pane {
+        let mut doc = Document::new(EditOptions::default());
+        doc.locks = Locks {
+            no_file: path.is_none(),
+            loading,
+            ..locks
+        };
+        Pane {
+            side,
+            slot: side as usize,
+            doc,
+            path: path.map(Path::to_path_buf),
+            info: None,
+            baseline: None,
+            title: path.map_or_else(String::new, |p| p.display().to_string()),
+            status: if loading {
+                LoadStatus::Loading {
+                    loaded: 0,
+                    total: 0,
+                }
+            } else {
+                LoadStatus::Ready
+            },
+            loads: None,
+            pending: None,
+            early_syntax: None,
+            prompt: None,
+            saving: None,
+            save_queued: None,
+            save_refused: false,
+            caret_column: RefCell::new(None),
+            seams: RefCell::new((None, 0, Vec::new())),
+            language: None,
+            language_chosen: false,
+            syntax: None,
+            syntax_over_limit: false,
+            symbols_pending: false,
+            bracket_cache: RefCell::new(None),
+            find: None,
+            search: None,
+            op_generation: 0,
+            pending_op: None,
+            cursor_history: std::collections::VecDeque::new(),
+            column: None,
+            occurrence_word: None,
+            expansions: Vec::new(),
+            expanded: None,
+            symbol_offsets: Vec::new(),
+            line_preview: None,
+            marked: (false, false, false),
+            spell: None,
+            spell_rev: 0,
+            watching: Watching::Idle,
+            disk: None,
+            deletion_shown: false,
+            restore: None,
+        }
+    }
+
+    /// The pane has unsaved changes.
+    fn dirty(&self) -> bool {
+        self.path.is_some() && self.doc.is_dirty()
+    }
+}
+
+/// The window: two panes and what they share (fonts, popups, prompts'
+/// session state, settings, the modes).
+pub struct Editor {
+    /// The pane with the keyboard focus.
+    pane: Pane,
+    /// The other pane.
+    other: Pane,
+    /// Diff mode: both panes read-only (`--diff-mode`, Toggle Diff Mode).
+    diff_mode: bool,
+    /// The view of both panes: they scroll together over the shared rows.
+    scroll: Scroll,
+    compare: Compare,
+    renderer: Renderer,
+    view: ViewBuilder,
+    list: DisplayList,
+    options: Options,
+    theme: Theme,
+    size: (u32, u32),
+    settings: Settings,
+    dpi: u32,
+    zoom: i32,
+    wheel: (i32, i32),
+    trace: Trace,
+    notice: Option<String>,
+    /// Quit or close the files once the running saves finish.
+    closing: Option<Exit>,
+    drag: Option<Drag>,
+    files: Arc<dyn FileOps>,
+    wake: Wake,
+    /// Window title last set; empty until the first event sets it (the
+    /// window starts with the command-line paths, which a rejected one
+    /// changes).
+    shown_title: String,
+    /// A frame was drawn (traced as `first_paint`).
+    painted: bool,
+    /// Syntax highlighting is on (`View: Toggle Syntax Highlighting`).
+    highlighting: bool,
+    bench: Option<bench::Driver>,
+    /// The first frame is on screen.
+    shown: bool,
+    popup: Option<Popup>,
+    /// Favorite and recent commands, read when the palette first opens.
+    store: Option<Store>,
+    /// Drops the space character that follows a handled `Ctrl+Space`.
+    skip_space: bool,
+    /// Popup font when the editor is zoomed: popups keep the size of zoom 0.
+    ui_renderer: Option<Renderer>,
+    /// About icon scaled to a side: (side, pixels).
+    about_icon: Option<(u32, Arc<[u32]>)>,
+    /// First key of a chord waiting for its second key.
+    chord: Option<Key>,
+    /// The window covers its monitor (`F11`), as the platform reported.
+    full_screen: bool,
+    /// Tooltip of the search box under the pointer.
+    tip: find::Tip,
+    spell_on: bool,
+    /// The spelling thread of both panes, once spelling started.
+    speller: Option<SpellThread>,
+    /// The notice of a save that failed while the other pane's save ran or
+    /// waited: it stays shown until both saves ended.
+    save_failure: Option<String>,
+    /// The pane (slot) whose symbols the last Go to Symbol palette lists:
+    /// a late reply of the other pane never fills it.
+    symbols_for: Option<usize>,
+}
+
+/// What a frame shows; a repaint is requested only when it changes.
+struct Visible {
+    side: Side,
+    snapshot: Snapshot,
+    saved: Snapshot,
+    selections: Selections,
+    scroll: Scroll,
+    px: f32,
+    prompt: Option<Prompt>,
+    notice: Option<String>,
+    saving: bool,
+    overtype: bool,
+    highlighting: bool,
+    /// Syntax generation and language.
+    syntax: (u64, Option<&'static str>),
+    locks: Locks,
+    /// Load state and shown percentage.
+    status: (u8, u64),
+    new_file: bool,
+    /// Fingerprint of what the popup shows.
+    popup: u64,
+    full_screen: bool,
+    slider_active: bool,
+    /// Revision of the spelling marks.
+    spelling: u64,
+    /// Version of the comparison drawn.
+    diff: u64,
+}
+
+impl Visible {
+    fn same(&self, other: &Visible) -> bool {
+        self.side == other.side
+            && self.snapshot.same_tree(&other.snapshot)
+            && self.saved.same_tree(&other.saved)
+            && self.selections == other.selections
+            && self.scroll == other.scroll
+            && self.px == other.px
+            && self.prompt == other.prompt
+            && self.notice == other.notice
+            && self.saving == other.saving
+            && self.overtype == other.overtype
+            && self.highlighting == other.highlighting
+            && self.syntax == other.syntax
+            && self.locks == other.locks
+            && self.status == other.status
+            && self.new_file == other.new_file
+            && self.popup == other.popup
+            && self.full_screen == other.full_screen
+            && self.slider_active == other.slider_active
+            && self.spelling == other.spelling
+            && self.diff == other.diff
+    }
+}
+
+/// Application name from `Meta/AppMeta.json` (exported by the build script).
+pub const APP_NAME: &str = env!("RTM_APP_NAME");
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const REPOSITORY_URL: &str = env!("RTM_REPOSITORY_URL");
+const DOCUMENTATION_URL: &str = env!("RTM_DOCUMENTATION_URL");
+/// Square About icon from the build script: premultiplied `0xAARRGGBB`, little-endian.
+static ABOUT_ICON: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/about_icon.bin"));
+/// "The Zen of Royi Text Merger", shown in the About panel.
+const MANIFEST: &str = include_str!("../../../Meta/Manifest.md");
+
+/// Window title for the files of the left and the right pane (the
+/// application name alone without files), marked when a pane has unsaved
+/// changes.
+pub fn window_title(left: Option<&Path>, right: Option<&Path>, dirty: bool) -> String {
+    let names = match (left, right) {
+        (Some(l), Some(r)) => format!("{} \u{2194} {}", display_name(l), display_name(r)),
+        (Some(p), None) | (None, Some(p)) => display_name(p),
+        (None, None) => return APP_NAME.to_owned(),
+    };
+    let mark = if dirty { "\u{25CF} " } else { "" };
+    format!("{mark}{names} - {APP_NAME}")
+}
+
+/// `"s"` unless `n` is 1.
+fn plural(n: u64) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
+impl Editor {
+    /// An editor on `path` in the left pane; the right pane starts empty
+    /// ([`Editor::open_right`] gives it its file).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        path: Option<&Path>,
+        first: Option<LoadEvent>,
+        loads: Option<Load>,
+        renderer: Renderer,
+        dpi: u32,
+        mut settings: Settings,
+        trace: Trace,
+        files: Arc<dyn FileOps>,
+        wake: Wake,
+    ) -> Editor {
+        let notice = settings.notice.clone();
+        let highlighting = settings.highlighting;
+        let spell_on = settings.spelling;
+        let diff_mode = settings.diff_mode;
+        let bench = settings.bench.take().map(bench::Driver::new);
+        let locks = |side| Editor::mode_locks(settings.read_only, diff_mode, side);
+        let mut pane = Pane::new(Side::Left, path, locks(Side::Left), loads.is_some());
+        pane.loads = loads;
+        pane.early_syntax = settings.early_syntax.take();
+        let other = Pane::new(Side::Right, None, locks(Side::Right), false);
+        let compare = Compare::new(wake.clone());
+        let mut editor = Editor {
+            pane,
+            other,
+            diff_mode,
+            scroll: Scroll::default(),
+            compare,
+            renderer,
+            view: ViewBuilder::default(),
+            list: DisplayList::default(),
+            options: Options::default(),
+            theme: Theme::DARK,
+            size: (0, 0),
+            settings,
+            dpi,
+            zoom: 0,
+            wheel: (0, 0),
+            trace,
+            notice,
+            closing: None,
+            drag: None,
+            files,
+            wake,
+            shown_title: String::new(),
+            painted: false,
+            highlighting,
+            bench,
+            shown: false,
+            popup: None,
+            store: None,
+            skip_space: false,
+            ui_renderer: None,
+            about_icon: None,
+            chord: None,
+            full_screen: false,
+            tip: find::Tip::default(),
+            spell_on,
+            speller: None,
+            save_failure: None,
+            symbols_for: None,
+        };
+        editor.adopt_first(first);
+        editor
+    }
+
+    /// Opens the right pane's file from the command line, as
+    /// [`Editor::new`] opens the left one.
+    pub fn open_right(
+        &mut self,
+        path: Option<&Path>,
+        first: Option<LoadEvent>,
+        loads: Option<Load>,
+        early_syntax: Option<EarlySyntax>,
+    ) {
+        let locks = Editor::mode_locks(self.settings.read_only, self.diff_mode, Side::Right);
+        let mut pane = Pane::new(Side::Right, path, locks, loads.is_some());
+        pane.loads = loads;
+        pane.early_syntax = early_syntax;
+        if self.pane.side == Side::Right {
+            self.pane = pane;
+        } else {
+            self.other = pane;
+        }
+        self.with_side(Side::Right, |e| e.adopt_first(first));
+    }
+
+    /// Applies the first load event of the pane's command-line file.
+    fn adopt_first(&mut self, first: Option<LoadEvent>) {
+        // `--syntax` belongs to the command-line files; without one it is unused.
+        if self.pane.path.is_some() {
+            self.choose_initial_language();
+        }
+        if let Some(event) = first {
+            self.apply_load(event);
+        }
+        // Events queued before the waker existed produced no wake-up.
+        self.drain_loads();
+    }
+
+    /// Locks a file opened on `side` starts with: `--read-only` locks the
+    /// left pane, diff mode both.
+    fn mode_locks(read_only: bool, diff: bool, side: Side) -> Locks {
+        Locks {
+            user: read_only && side == Side::Left,
+            diff,
+            ..Locks::default()
+        }
+    }
+
+    /// Runs `f` on the other pane (as `self.pane`), then restores the focus.
+    fn with_other<R>(&mut self, f: impl FnOnce(&mut Editor) -> R) -> R {
+        std::mem::swap(&mut self.pane, &mut self.other);
+        let result = f(self);
+        std::mem::swap(&mut self.pane, &mut self.other);
+        result
+    }
+
+    /// Runs `f` on the pane of `side` (as `self.pane`).
+    fn with_side<R>(&mut self, side: Side, f: impl FnOnce(&mut Editor) -> R) -> R {
+        if self.pane.side == side {
+            f(self)
+        } else {
+            self.with_other(f)
+        }
+    }
+
+    fn pane_of(&self, side: Side) -> &Pane {
+        if self.pane.side == side {
+            &self.pane
+        } else {
+            &self.other
+        }
+    }
+
+    fn pane_of_mut(&mut self, side: Side) -> &mut Pane {
+        if self.pane.side == side {
+            &mut self.pane
+        } else {
+            &mut self.other
+        }
+    }
+
+    /// Gives the keyboard focus to the pane of `side`.
+    fn focus(&mut self, side: Side) {
+        if self.pane.side != side {
+            std::mem::swap(&mut self.pane, &mut self.other);
+            self.drag = None;
+            self.tip = find::Tip::default();
+        }
+    }
+
+    /// The pane under the window point, if any (its gutter, text or scroll
+    /// strip).
+    fn side_at(&self, x: i32, y: i32) -> Option<Side> {
+        [Side::Left, Side::Right]
+            .into_iter()
+            .find(|&side| self.layout_of(side).pane().contains(x, y))
+    }
+
+    /// Applies `--syntax <id>`; an unknown id keeps detection.
+    fn choose_initial_language(&mut self) {
+        let Some(id) = self.settings.syntax.as_deref() else {
+            return;
+        };
+        if id.eq_ignore_ascii_case("none") || id.eq_ignore_ascii_case("off") {
+            return;
+        }
+        match rtm_syntax::by_id(id) {
+            Some(lang) => {
+                self.pane.language = Some(lang);
+                self.pane.language_chosen = true;
+            }
+            None => {
+                self.notice = Some(format!(
+                    "Unknown syntax {id:?}: the language follows the file name"
+                ));
+            }
+        }
+    }
+
+    /// Detects the language from the path and the first bytes, unless chosen.
+    fn detect_language(&mut self) {
+        if self.pane.language_chosen {
+            return;
+        }
+        let s = &self.pane.doc.snapshot;
+        self.pane.language = self
+            .pane
+            .path
+            .as_deref()
+            .and_then(|path| crate::syntax::detect(path, s));
+    }
+
+    /// Starts (or stops) the syntax thread for the current language, text
+    /// and settings. Plain text runs no syntax work.
+    fn restart_syntax(&mut self) {
+        // Taken first so that no early thread outlives a decision against it.
+        let early = self
+            .pane
+            .early_syntax
+            .take()
+            .and_then(|slot| slot.lock().ok()?.close());
+        self.pane.syntax = None;
+        self.pane.doc.journal = None;
+        self.pane.syntax_over_limit = false;
+        self.pane.symbols_pending = false;
+        *self.pane.bracket_cache.get_mut() = None;
+        let Some(lang) = self.pane.language else {
+            return;
+        };
+        // The empty state runs no syntax work, whatever the language.
+        if self.no_file() {
+            return;
+        }
+        if !self.highlighting || !matches!(self.pane.status, LoadStatus::Ready) {
+            return;
+        }
+        let max = self.settings.syntax_max_mib;
+        if self.pane.doc.snapshot.len() > max * 1024 * 1024 {
+            self.pane.syntax_over_limit = true;
+            self.notice = Some(format!(
+                "Syntax highlighting off: the file is larger than {max} MiB"
+            ));
+            return;
+        }
+        self.pane.doc.journal = Some(Vec::new());
+        self.pane.syntax = Some(match early {
+            Some((l, syntax))
+                if std::ptr::eq(l, lang) && syntax.is_for(&self.pane.doc.snapshot) =>
+            {
+                syntax
+            }
+            _ => Syntax::start(
+                lang,
+                self.pane.doc.snapshot.clone(),
+                self.settings.injections,
+                self.wake.clone(),
+            ),
+        });
+        self.sync_syntax();
+    }
+
+    /// Sends edits and the visible range to the syntax thread. Growing past
+    /// `syntax.maxFileMiB` stops highlighting; shrinking below restarts it.
+    fn sync_syntax(&mut self) {
+        let over = self.pane.doc.snapshot.len() > self.settings.syntax_max_mib * 1024 * 1024;
+        if over && self.pane.syntax.is_some() || !over && self.pane.syntax_over_limit {
+            self.restart_syntax();
+            return;
+        }
+        if self.pane.syntax.is_none() {
+            return;
+        }
+        let (visible, margin) = self.visible_bytes();
+        if let Some(syntax) = &mut self.pane.syntax {
+            syntax.sync(&mut self.pane.doc, margin.clone());
+            syntax.set_visible(visible, margin);
+        }
+    }
+
+    fn drain_syntax(&mut self) {
+        let Some(syntax) = &mut self.pane.syntax else {
+            return;
+        };
+        syntax.poll();
+        if let Some(e) = syntax.failed() {
+            self.notice = Some(format!("Syntax highlighting off: {e}"));
+            self.pane.syntax = None;
+            self.pane.doc.journal = None;
+            return;
+        }
+        if let Some(symbols) = syntax.take_symbols() {
+            self.show_symbols(&symbols);
+        }
+    }
+
+    /// Drawn bytes of the visible rows (at most [`ROW_SCAN_LIMIT`] per row,
+    /// plus the visible part of a long line past it), adjacent rows merged.
+    fn visible_ranges(&self) -> Vec<std::ops::Range<u64>> {
+        let s = &self.pane.doc.snapshot;
+        let mut ranges: Vec<std::ops::Range<u64>> = Vec::new();
+        let mut push = |r: std::ops::Range<u64>| match ranges.last_mut() {
+            Some(last) if last.end >= r.start => last.end = last.end.max(r.end),
+            _ => ranges.push(r),
+        };
+        for line in self.view_lines() {
+            let Some(range) = s.line_range(line) else {
+                break;
+            };
+            // The line break belongs to the row (CRLF, comment ends).
+            let with_break = (range.end + 1).min(s.len());
+            push(range.start..with_break.min(range.start + ROW_SCAN_LIMIT as u64));
+            if let Some(tail) = self.long_row_tail(range.clone()) {
+                push(
+                    tail.start..if tail.end == range.end {
+                        with_break
+                    } else {
+                        tail.end
+                    },
+                );
+            }
+        }
+        ranges
+    }
+
+    /// Bytes of a long line past its scan end that the view draws, with up
+    /// to 3 more at each edge (whole characters); `None` when not visible.
+    pub(super) fn long_row_tail(&self, line: std::ops::Range<u64>) -> Option<std::ops::Range<u64>> {
+        if line.end - line.start <= ROW_SCAN_LIMIT as u64 {
+            return None;
+        }
+        let first = self.scroll.first_col;
+        let end_col = first + u64::from(self.layout().cols + 1);
+        let (seam, seam_col) = self.seam(line.start, end_col)?;
+        let base = line.start + seam;
+        let from = base + first.saturating_sub(seam_col).saturating_sub(3);
+        let to = (base + (end_col - seam_col) + 3).min(line.end);
+        (from < to).then_some(from..to)
+    }
+
+    /// Scan end of the long line at `start` and its column, when that column
+    /// is before `until` (reads only up to `until` columns otherwise, so a
+    /// view at the line start never scans 64 KiB).
+    fn seam(&self, start: u64, until: u64) -> Option<(u64, u64)> {
+        let s = &self.pane.doc.snapshot;
+        let tab = self.options.tab_width;
+        let mut cache = self.pane.seams.borrow_mut();
+        if !cache.0.as_ref().is_some_and(|c| c.same_tree(s)) || cache.1 != tab {
+            *cache = (Some(s.clone()), tab, Vec::new());
+        }
+        if let Some(&(_, seam, col)) = cache.2.iter().find(|e| e.0 == start) {
+            return (col < until).then_some((seam, col));
+        }
+        let limit = ROW_SCAN_LIMIT as u64;
+        let mut window = until.saturating_mul(4).saturating_add(256).min(limit);
+        loop {
+            let bytes = s.to_vec(start..start + window);
+            let end = edit::scan_end(&bytes);
+            let col = edit::column_until(&bytes[..end], until, tab)?;
+            if window == limit {
+                if cache.2.len() >= 256 {
+                    cache.2.clear();
+                }
+                cache.2.push((start, end as u64, col));
+                return (col < until).then_some((end as u64, col));
+            }
+            window = window.saturating_mul(4).min(limit);
+        }
+    }
+
+    /// The span of the drawn bytes, and a page of rows above and below it
+    /// (parsed ahead), each row counted at most [`ROW_SCAN_LIMIT`] bytes.
+    fn visible_bytes(&self) -> (std::ops::Range<u64>, std::ops::Range<u64>) {
+        let s = &self.pane.doc.snapshot;
+        let rows = u64::from(self.layout().rows.max(1));
+        let lines = self.view_lines();
+        let ranges = self.visible_ranges();
+        let visible = match (ranges.first(), ranges.last()) {
+            (Some(first), Some(last)) => first.start..last.end,
+            _ => s.len()..s.len(),
+        };
+        let page = rows * ROW_SCAN_LIMIT as u64;
+        let before = s
+            .line_start(lines.start.saturating_sub(rows))
+            .unwrap_or(0)
+            .max(visible.start.saturating_sub(page));
+        let after = s
+            .line_start(lines.end + rows)
+            .unwrap_or(s.len())
+            .min(visible.end + page)
+            .max(visible.end);
+        (visible, before..after)
+    }
+
+    /// Applies queued load events. A loader that disconnects before its final
+    /// event becomes a visible failure instead of an endless "Loading".
+    fn drain_loads(&mut self) {
+        let Some(load) = &self.pane.loads else {
+            return;
+        };
+        let mut events = Vec::new();
+        let disconnected = loop {
+            match load.events.try_recv() {
+                Ok(event) => events.push(event),
+                Err(TryRecvError::Empty) => break false,
+                Err(TryRecvError::Disconnected) => break true,
+            }
+        };
+        for event in events {
+            self.apply_load(event);
+        }
+        if disconnected {
+            self.pane.loads = None;
+            if matches!(self.pane.status, LoadStatus::Loading { .. }) {
+                self.apply_load(LoadEvent::Failed {
+                    snapshot: self.pane.doc.snapshot.clone(),
+                    error: "loading stopped unexpectedly".to_owned(),
+                });
+            }
+        }
+    }
+
+    fn apply_load(&mut self, event: LoadEvent) {
+        if !matches!(event, LoadEvent::Progress { .. }) {
+            self.trace.mark("load_done");
+            self.pane.doc.locks.loading = false;
+        }
+        match event {
+            LoadEvent::Progress {
+                snapshot,
+                loaded,
+                total,
+            } => {
+                self.pane.doc.load(snapshot);
+                self.pane.status = LoadStatus::Loading { loaded, total };
+            }
+            LoadEvent::Done {
+                snapshot,
+                info,
+                baseline,
+                read_ms,
+            } => {
+                self.trace.mark_at("file_read", read_ms);
+                self.pane.doc.load(snapshot);
+                self.pane.doc.locks.encoding = info.malformed;
+                self.pane.doc.options.line_ending = info.line_ending;
+                self.pane.doc.options.insert_spaces = !info.indent_tabs;
+                self.pane.info = Some(info);
+                self.pane.baseline = baseline;
+                self.pane.status = LoadStatus::Ready;
+                self.detect_language();
+                self.restart_syntax();
+                if let Some((scroll, caret)) = self.pane.restore.take() {
+                    let s = &self.pane.doc.snapshot;
+                    let caret = edit::snap_to_boundary(s, caret.min(s.len()));
+                    self.pane
+                        .doc
+                        .select(Selections::single(Selection::caret(caret)));
+                    self.scroll = scroll;
+                }
+            }
+            LoadEvent::Failed { snapshot, error } => {
+                self.pane.restore = None;
+                self.pane.doc.load(snapshot);
+                self.pane.doc.locks.load_error = true;
+                self.pane.status = LoadStatus::Failed(error);
+            }
+            // A folder named on the command line: the empty state.
+            LoadEvent::Rejected(reason) => {
+                self.reset_document(None);
+                self.notice = Some(reason);
+            }
+        }
+        self.clamp_scroll();
+    }
+
+    /// Every present file is loaded and, with two files, their first exact
+    /// comparison is shown: `--exit-after-load` and scripted benchmarks
+    /// wait for it.
+    fn loaded_and_compared(&self) -> bool {
+        let loading = |p: &Pane| matches!(p.status, LoadStatus::Loading { .. });
+        !loading(&self.pane) && !loading(&self.other) && !self.comparing()
+    }
+
+    /// `--exit-after-load`: report the trace and close once the window shows
+    /// its first frame (traced on [`Event::Shown`], after the first presented
+    /// frame) and [`Editor::loaded_and_compared`]; `--exit-after-highlight`
+    /// also waits for the marks of [`Editor::mark_highlights`]. Checked
+    /// after every wake-up (loaders, diff, spelling) and presented frame
+    /// (highlights).
+    fn exit_if_ready(&mut self, ctx: &mut Ctx) {
+        let highlights_marked = (self.pane.syntax.is_none() || self.pane.marked.1)
+            && (!self.spelling_wanted() || self.pane.marked.2);
+        let ready = if self.settings.exit_after_highlight {
+            highlights_marked
+        } else {
+            self.settings.exit_after_load
+        };
+        if ready && self.shown && self.loaded_and_compared() {
+            self.trace.report();
+            ctx.close();
+        }
+    }
+
+    /// Trace marks of the first highlighted frame, of the first one from a
+    /// parse of the whole file and of the first complete spelling marks
+    /// (`--trace-startup`).
+    fn mark_highlights(&mut self) {
+        if let Some(syntax) = &self.pane.syntax {
+            if !self.pane.marked.0 && syntax.highlighted() {
+                self.pane.marked.0 = true;
+                self.trace.mark("highlighted");
+            }
+            if !self.pane.marked.1 && syntax.fully_highlighted() {
+                self.pane.marked.1 = true;
+                self.trace.mark("fully_highlighted");
+            }
+        }
+        if !self.pane.marked.2 && self.spelling_wanted() && self.spelling_complete() {
+            self.pane.marked.2 = true;
+            self.trace.mark("spelling_marks");
+        }
+    }
+
+    fn px(&self) -> f32 {
+        let zoom = 1.1f32.powi(self.zoom);
+        (BASE_PX * self.dpi as f32 / 96.0 * zoom).round()
+    }
+
+    /// Layout of the focused pane.
+    fn layout(&self) -> Layout {
+        self.layout_of(self.pane.side)
+    }
+
+    /// Layout of the pane of `side`: its half of the window beside the
+    /// divider, the shared title strip and status line.
+    fn layout_of(&self, side: Side) -> Layout {
+        let pane = self.pane_of(side);
+        let options = Options {
+            title_strip: !self.full_screen,
+            // The scroll strip of both panes (slider and overview ruler):
+            // 14 px at 96 DPI.
+            scroll_strip: if self.strip_side() == Some(side) {
+                (14 * self.dpi + 48) / 96
+            } else {
+                0
+            },
+            pane: Some(side),
+            ..self.options
+        };
+        Layout::new(
+            self.size.0,
+            self.size.1,
+            self.renderer.cell(),
+            pane.doc.snapshot.line_count(),
+            &options,
+        )
+    }
+
+    /// The pane holding the scroll strip: the right one, or the left one
+    /// when only it has a file.
+    fn strip_side(&self) -> Option<Side> {
+        [Side::Right, Side::Left]
+            .into_iter()
+            .find(|&side| self.pane_of(side).path.is_some())
+    }
+
+    /// The scroll strip (slider track and overview ruler), if shown.
+    fn strip(&self) -> Option<rtm_view::Rect> {
+        let track = self.layout_of(self.strip_side()?).scrollbar;
+        (track.w > 0 && track.h > 0).then_some(track)
+    }
+
+    /// The scroll slider of the current view, if shown.
+    fn slider(&self) -> Option<rtm_view::Rect> {
+        let layout = self.layout_of(self.strip_side()?);
+        let cell = self.renderer.cell();
+        let page = rtm_view::page_rows(&layout, cell);
+        rtm_view::slider(
+            &layout,
+            self.row_count(),
+            self.scroll.top_row,
+            page,
+            cell.height,
+        )
+    }
+
+    fn slider_active(&self) -> bool {
+        matches!(
+            self.drag,
+            Some(Drag {
+                mode: DragMode::Slider { .. },
+                ..
+            })
+        )
+    }
+
+    /// Scrolls so the slider's top is at `y` (window pixels), as far as
+    /// its track allows.
+    fn drag_slider(&mut self, y: i32) {
+        let Some((slider, track)) = self.slider().zip(self.strip()) else {
+            return;
+        };
+        let travel = i64::from(track.h - slider.h);
+        if travel <= 0 {
+            return;
+        }
+        let top = i64::from(y - track.y).clamp(0, travel);
+        let last = self.row_count() as i64 - 1;
+        self.scroll.top_row = ((top * last + travel / 2) / travel) as u64;
+        self.clamp_scroll();
+    }
+
+    fn toggle_full_screen(&mut self, ctx: &mut Ctx) {
+        ctx.set_full_screen(!self.full_screen);
+    }
+
+    /// Fully visible text rows (at least one).
+    fn page(&self) -> u64 {
+        let cell = self.renderer.cell();
+        u64::from((self.layout().text.h / cell.height.max(1)).max(1))
+    }
+
+    /// Scrolls both panes by `delta` rows.
+    fn scroll_rows(&mut self, delta: i64) {
+        self.scroll.top_row = self.scroll.top_row.saturating_add_signed(delta);
+        self.clamp_scroll();
+    }
+
+    fn scroll_cols(&mut self, delta: i64) {
+        self.scroll.first_col = self.scroll.first_col.saturating_add_signed(delta);
+    }
+
+    /// Keeps the last row reachable at the top, as far as scrolling goes.
+    fn clamp_scroll(&mut self) {
+        self.refresh_alignment();
+        let last = self.row_count().saturating_sub(1);
+        self.scroll.top_row = self.scroll.top_row.min(last);
+    }
+
+    fn set_zoom(&mut self, zoom: i32) {
+        self.zoom = zoom.clamp(-8, 16);
+        let px = self.px();
+        self.renderer.set_size(px);
+    }
+
+    /// Scrolls so the primary caret is visible.
+    fn reveal(&mut self) {
+        self.refresh_alignment();
+        let head = self.pane.doc.selections.primary().head;
+        let row = self.row_of(self.pane.doc.snapshot.line_of(head));
+        let page = self.page();
+        if row < self.scroll.top_row {
+            self.scroll.top_row = row;
+        } else if row >= self.scroll.top_row + page {
+            self.scroll.top_row = row + 1 - page;
+        }
+        let col = self.caret_column(head);
+        let cols = u64::from(self.layout().cols.max(1));
+        if col < self.scroll.first_col {
+            self.scroll.first_col = col.saturating_sub(REVEAL_MARGIN);
+        } else if col >= self.scroll.first_col + cols {
+            self.scroll.first_col = (col + REVEAL_MARGIN).saturating_sub(cols - 1);
+        }
+    }
+
+    fn edit_options(&self) -> EditOptions {
+        EditOptions {
+            tab_width: self.options.tab_width,
+            ..self.pane.doc.options
+        }
+    }
+
+    /// Display column of `head`, reused while the text, caret and tab width
+    /// are unchanged (reveal and the status line ask for the same caret).
+    fn caret_column(&self, head: u64) -> u64 {
+        let tab = self.options.tab_width;
+        if let Some((snapshot, h, t, col)) = &*self.pane.caret_column.borrow()
+            && snapshot.same_tree(&self.pane.doc.snapshot)
+            && (*h, *t) == (head, tab)
+        {
+            return *col;
+        }
+        let col = edit::column_at(&self.pane.doc.snapshot, head, tab);
+        *self.pane.caret_column.borrow_mut() =
+            Some((self.pane.doc.snapshot.clone(), head, tab, col));
+        col
+    }
+
+    fn visible(&self) -> Visible {
+        let status = match &self.pane.status {
+            LoadStatus::Loading { loaded, total } => (0, loaded * 100 / (*total).max(1)),
+            LoadStatus::Ready => (1, 0),
+            LoadStatus::Failed(_) => (2, 0),
+        };
+        Visible {
+            side: self.pane.side,
+            snapshot: self.pane.doc.snapshot.clone(),
+            saved: self.pane.doc.saved.clone(),
+            selections: self.pane.doc.selections.clone(),
+            scroll: self.scroll,
+            px: self.renderer.px(),
+            prompt: self.pane.prompt,
+            notice: self.notice.clone(),
+            saving: self.pane.saving.is_some(),
+            overtype: self.pane.doc.options.overtype,
+            highlighting: self.highlighting,
+            syntax: (
+                self.pane.syntax.as_ref().map_or(0, Syntax::generation),
+                self.pane.language.map(|l| l.id),
+            ),
+            locks: self.pane.doc.locks,
+            status,
+            new_file: self.pane.info.is_some_and(|i| i.new_file),
+            popup: self.popup_view(),
+            full_screen: self.full_screen,
+            slider_active: self.slider_active(),
+            spelling: self.pane.spell_rev,
+            diff: self.compare.version(),
+        }
+    }
+
+    /// Applies `cmd` (if any) and reveals the caret; locks show a notice.
+    fn run(&mut self, cmd: Option<Command>, typed: Option<char>) {
+        let Some(cmd) = cmd else {
+            return;
+        };
+        match self.pane.doc.apply(&cmd, typed) {
+            Ok(()) => self.reveal(),
+            Err(reason) => self.notice = Some(format!("Not editable: {reason}")),
+        }
+    }
+
+    /// Moves every caret to `f(snapshot, selection) = (head, goal)`; with
+    /// `extend` the anchors stay.
+    fn move_heads(
+        &mut self,
+        extend: bool,
+        mut f: impl FnMut(&Snapshot, &Selection) -> (u64, Option<u64>),
+    ) {
+        let snapshot = &self.pane.doc.snapshot;
+        let sels = self.pane.doc.selections.map(|sel| {
+            let (head, goal) = f(snapshot, sel);
+            Selection {
+                anchor: if extend { sel.anchor } else { head },
+                head,
+                goal,
+            }
+        });
+        self.pane.doc.select(sels);
+        self.reveal();
+    }
+
+    fn select_single(&mut self, selection: Selection) {
+        self.pane.doc.select(Selections::single(selection));
+    }
+
+    fn undo_redo(&mut self, redo: bool) {
+        let result = if redo {
+            self.pane.doc.redo()
+        } else {
+            self.pane.doc.undo()
+        };
+        match result {
+            Ok(true) => self.reveal(),
+            Ok(false) => {}
+            Err(reason) => self.notice = Some(format!("Not editable: {reason}")),
+        }
+    }
+
+    fn copy(&mut self, ctx: &mut Ctx, cut: bool) {
+        let opts = self.edit_options();
+        let (snapshot, sels) = (&self.pane.doc.snapshot, &self.pane.doc.selections);
+        if cut && let Some(reason) = self.pane.doc.locks.edit_refusal() {
+            self.notice = Some(format!("Not editable: {reason}"));
+            return;
+        }
+        let (clip, cmd) = if cut {
+            edit::cut(snapshot, sels, &opts)
+        } else {
+            (edit::copy(snapshot, sels, &opts), None)
+        };
+        let (text, data) = clip::encode(clip, opts.line_ending);
+        if !ctx.set_clipboard(&text, clip::FORMAT, &data) {
+            self.notice = Some("The clipboard is not available".to_owned());
+            return;
+        }
+        self.run(cmd, None);
+    }
+
+    /// The file's absolute path, or only its name, as plain text.
+    fn copy_file_path(&mut self, name_only: bool, ctx: &mut Ctx) {
+        let Some(path) = self.pane.path.as_deref() else {
+            return;
+        };
+        let text = if name_only {
+            display_name(path)
+        } else {
+            std::path::absolute(path)
+                .unwrap_or_else(|_| path.to_owned())
+                .display()
+                .to_string()
+        };
+        if !ctx.set_clipboard(&text, clip::FORMAT, &[]) {
+            self.notice = Some("The clipboard is not available".to_owned());
+        }
+    }
+
+    fn paste(&mut self, ctx: &mut Ctx) {
+        let Some((text, data)) = ctx.clipboard(clip::FORMAT) else {
+            return;
+        };
+        let clip = clip::decode(text, data.as_deref());
+        let opts = self.edit_options();
+        let cmd = edit::paste(
+            &self.pane.doc.snapshot,
+            &self.pane.doc.selections,
+            &clip,
+            &opts,
+        );
+        self.run(cmd, None);
+    }
+
+    /// `Ctrl+S`. Returns false when saving is refused. One save runs at a
+    /// time in the session: a request while either pane saves waits.
+    fn request_save(&mut self) -> bool {
+        if let Some(reason) = self.pane.doc.locks.save_refusal() {
+            self.notice = Some(format!("Cannot save: {reason}"));
+            return false;
+        }
+        self.queue_save(Queued::Baseline);
+        true
+    }
+
+    /// Starts the save, or queues it while either pane saves.
+    fn queue_save(&mut self, queued: Queued) {
+        if self.pane.saving.is_some() || self.other.saving.is_some() {
+            self.pane.save_queued = Some(queued);
+        } else {
+            self.start_queued(queued);
+        }
+    }
+
+    fn start_queued(&mut self, queued: Queued) {
+        let baseline = match queued {
+            Queued::Baseline => self.pane.baseline,
+            Queued::Disk(disk) => Some(disk),
+        };
+        self.start_save(baseline);
+    }
+
+    /// `File: Save All`: saves every pane with unsaved changes, the focused
+    /// one first.
+    fn save_all(&mut self) {
+        if self.pane.dirty() {
+            self.request_save();
+        }
+        if self.other.dirty() {
+            self.with_other(Editor::request_save);
+        }
+    }
+
+    /// Starts a queued save once no save runs (the focused pane first).
+    fn pump_saves(&mut self) {
+        if self.pane.saving.is_some() || self.other.saving.is_some() {
+            return;
+        }
+        for side in [self.pane.side, self.other.side] {
+            let started = self.with_side(side, |e| {
+                let Some(queued) = e.pane.save_queued.take() else {
+                    return false;
+                };
+                e.start_queued(queued);
+                true
+            });
+            if started {
+                return;
+            }
+        }
+        // The saves ended: a failure is shown no longer than other notices.
+        self.save_failure = None;
+    }
+
+    /// Ends a close once no save runs or waits and no question is open:
+    /// unsaved changes ask (again), otherwise quit or close the files.
+    fn settle_close(&mut self, ctx: &mut Ctx) {
+        let Some(exit) = self.closing else {
+            return;
+        };
+        let busy = |p: &Pane| p.saving.is_some() || p.save_queued.is_some() || p.prompt.is_some();
+        if busy(&self.pane) || busy(&self.other) {
+            return;
+        }
+        self.closing = None;
+        if self.pane.dirty() || self.other.dirty() {
+            self.pane.prompt = Some(Prompt::DirtyClose(exit));
+        } else {
+            self.finish_exit(exit, ctx);
+        }
+    }
+
+    /// `Diff: Swap Sides`: the panes exchange sides with everything they
+    /// hold. `--read-only` belongs to the left side, so each pane's
+    /// read-only state returns to its new side's, as for an opened file.
+    fn swap_sides(&mut self) {
+        for pane in [&mut self.pane, &mut self.other] {
+            pane.side = pane.side.other();
+            pane.doc.locks.user = self.settings.read_only && pane.side == Side::Left;
+        }
+        self.mirror_diff();
+        self.notice = Some("Sides swapped".to_owned());
+    }
+
+    /// `Diff: Toggle Diff Mode`: both panes read-only, or editable again as
+    /// their own read-only state allows.
+    fn toggle_diff_mode(&mut self) {
+        self.diff_mode = !self.diff_mode;
+        for pane in [&mut self.pane, &mut self.other] {
+            pane.doc.locks.diff = self.diff_mode;
+        }
+        let state = if self.diff_mode { "on" } else { "off" };
+        self.notice = Some(format!("Diff mode {state}"));
+    }
+    /// Starts saving the current snapshot against `baseline`.
+    fn start_save(&mut self, baseline: Option<Baseline>) {
+        let Some(path) = self.pane.path.clone() else {
+            return;
+        };
+        let encoding = self.pane.info.map_or(Encoding::Utf8, |i| i.encoding);
+        let wake = self.wake.clone();
+        // Edits after this point start a new undo step, so undo reaches the saved text.
+        self.pane.doc.history.seal();
+        self.pane.save_refused = false;
+        let request = SaveRequest {
+            path,
+            snapshot: self.pane.doc.snapshot.clone(),
+            encoding,
+            baseline,
+        };
+        self.pane.saving = Some(save::spawn(self.files.clone(), request, move || wake()));
+    }
+
+    fn drain_saves(&mut self) {
+        let Some(rx) = &self.pane.saving else {
+            return;
+        };
+        let outcome = match rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => SaveOutcome::Failed {
+                error: "Saving stopped unexpectedly; the file may be unchanged".to_owned(),
+            },
+        };
+        self.pane.saving = None;
+        match outcome {
+            SaveOutcome::Saved {
+                snapshot,
+                baseline,
+                warning,
+            } => {
+                self.pane.doc.saved = snapshot;
+                self.pane.doc.history.seal();
+                self.pane.baseline = baseline;
+                self.wrote_file();
+                if let Some(info) = self.pane.info.as_mut() {
+                    info.new_file = false;
+                }
+                // A failure of the other pane's save stays shown.
+                self.notice = Some(
+                    self.save_failure
+                        .clone()
+                        .or(warning)
+                        .unwrap_or_else(|| "Saved".to_owned()),
+                );
+            }
+            SaveOutcome::Conflict { disk } => {
+                self.pane.save_queued = None;
+                self.pane.prompt = Some(Prompt::Changed(disk));
+            }
+            SaveOutcome::ReadOnly => {
+                self.pane.save_queued = None;
+                self.pane.save_refused = true;
+                let name = self
+                    .pane
+                    .path
+                    .as_deref()
+                    .map(display_name)
+                    .unwrap_or_default();
+                self.save_failed(format!(
+                    "{name} is read-only. Clear its Read-only attribute and save again"
+                ));
+            }
+            SaveOutcome::Failed { error } => {
+                self.pane.save_queued = None;
+                self.save_failed(error);
+            }
+        }
+    }
+
+    /// Shows a failed save; kept while the other pane's save still runs or
+    /// waits (Save All, closing).
+    fn save_failed(&mut self, notice: String) {
+        if self.other.saving.is_some() || self.other.save_queued.is_some() {
+            self.save_failure = Some(notice.clone());
+        }
+        self.notice = Some(notice);
+    }
+
+    /// Quit (`Alt+F4`, `Ctrl+Shift+W`, the window close request), asking
+    /// first about unsaved changes; waits for a running save.
+    fn request_close(&mut self, ctx: &mut Ctx) {
+        self.cancel_pending();
+        self.with_other(Editor::cancel_pending);
+        if self.pane.saving.is_some() || self.other.saving.is_some() {
+            self.closing = Some(Exit::Quit);
+        } else if self.pane.dirty() || self.other.dirty() {
+            self.pane.prompt = Some(Prompt::DirtyClose(Exit::Quit));
+        } else {
+            ctx.close();
+        }
+    }
+
+    fn prompt_key(&mut self, prompt: Prompt, key: Key, ctx: &mut Ctx) {
+        let plain = !key.ctrl && !key.alt;
+        match (prompt, key.vk) {
+            (Prompt::DirtyClose(_), VK_ESCAPE) => {
+                self.pane.prompt = None;
+                self.closing = None;
+            }
+            (Prompt::DirtyClose(exit), VK_RETURN | VK_S) if plain => {
+                self.pane.prompt = None;
+                self.closing = Some(exit);
+                // Every dirty pane saves; a refusal keeps the question.
+                let sides = [self.pane.side, self.other.side];
+                let saved =
+                    sides.map(|side| self.with_side(side, |e| !e.pane.dirty() || e.request_save()));
+                if saved.contains(&false) {
+                    self.closing = None;
+                    self.pane.prompt = Some(Prompt::DirtyClose(exit));
+                }
+            }
+            (Prompt::DirtyClose(exit), VK_D | VK_N) if plain => {
+                self.pane.prompt = None;
+                self.finish_exit(exit, ctx);
+            }
+            (Prompt::Changed(disk), VK_S)
+                if plain && self.pane.doc.locks.save_refusal().is_none() =>
+            {
+                self.pane.prompt = None;
+                self.queue_save(Queued::Disk(disk));
+            }
+            (Prompt::Changed(_), VK_R) if plain => {
+                self.pane.prompt = None;
+                self.closing = None;
+                self.reload();
+            }
+            _ => {}
+        }
+    }
+
+    /// After an own save: the file holds the new baseline. Older reports
+    /// are dropped and a fresh one is asked for; an ended watcher restarts.
+    fn wrote_file(&mut self) {
+        self.pane.disk = Some(self.pane.baseline.map(|b| b.stamp));
+        match &self.pane.watching {
+            Watching::Running(watcher) => watcher.refresh(),
+            Watching::Ended => self.pane.watching = Watching::Idle,
+            Watching::Idle => {}
+        }
+    }
+
+    /// Starts the watcher once the file is loaded and on screen.
+    fn sync_watcher(&mut self) {
+        if !matches!(self.pane.watching, Watching::Idle)
+            || !self.shown
+            || self.pane.pending.is_some()
+            || !matches!(self.pane.status, LoadStatus::Ready)
+        {
+            return;
+        }
+        let Some(path) = self.pane.path.as_deref() else {
+            return;
+        };
+        self.pane.watching = match Watcher::spawn(path, self.files.clone(), self.wake.clone()) {
+            Ok(watcher) => Watching::Running(watcher),
+            Err(_) => Watching::Ended,
+        };
+    }
+
+    fn drain_watcher(&mut self) {
+        let Watching::Running(watcher) = &self.pane.watching else {
+            return;
+        };
+        let polled = watcher.poll();
+        if let Some(stamp) = polled.latest {
+            self.pane.disk = Some(stamp);
+        }
+        if polled.ended {
+            self.pane.watching = Watching::Ended;
+        }
+    }
+
+    /// Asks Reload or Save Current when the file on disk is not the version
+    /// last loaded or saved (a notice when it is gone); waits while a save
+    /// runs or waits, a load, a close or another prompt runs.
+    fn check_disk(&mut self) {
+        let Some(disk) = self.pane.disk else {
+            return;
+        };
+        if self.pane.prompt.is_some()
+            || self.pane.saving.is_some()
+            || self.pane.save_queued.is_some()
+            || self.closing.is_some()
+            || self.pane.pending.is_some()
+            || !matches!(self.pane.status, LoadStatus::Ready)
+            || self.no_file()
+        {
+            return;
+        }
+        if disk == self.pane.baseline.map(|b| b.stamp) {
+            self.pane.deletion_shown = false;
+            return;
+        }
+        match disk {
+            Some(stamp) => {
+                self.pane.deletion_shown = false;
+                self.pane.prompt = Some(Prompt::Changed(Baseline { stamp, hash: None }));
+            }
+            None if !self.pane.deletion_shown => {
+                self.pane.deletion_shown = true;
+                let name = self
+                    .pane
+                    .path
+                    .as_deref()
+                    .map(display_name)
+                    .unwrap_or_default();
+                self.notice = Some(format!("{name} was deleted on disk; saving recreates it"));
+            }
+            None => {}
+        }
+    }
+
+    /// `R`: opens the file again as a drop does, dropping unsaved changes
+    /// and the history; the scroll and the caret come back once loaded.
+    fn reload(&mut self) {
+        let Some(path) = self.pane.path.clone() else {
+            return;
+        };
+        let restore = (self.scroll, self.pane.doc.selections.primary().head);
+        let name = display_name(&path);
+        self.start_open(path, None, Some(restore));
+        self.notice = Some(format!("Reloading {name}\u{2026}"));
+    }
+
+    fn key(&mut self, key: Key, ctx: &mut Ctx) -> bool {
+        if let Some(prompt) = self.pane.prompt {
+            self.prompt_key(prompt, key, ctx);
+            return true;
+        }
+        if self.closing.is_some() {
+            return true;
+        }
+        if let Some(first) = self.chord.take() {
+            match commands::for_chord(first, key) {
+                // From the find box only its own and the session's commands run.
+                Some(def) if self.find_focused() && !find::works_in_find(def.action) => {}
+                Some(def) => {
+                    self.notice = None;
+                    self.perform(def.action, ctx);
+                }
+                None => {
+                    self.notice = Some(format!(
+                        "The key combination {} {} is not a command",
+                        key_name(first),
+                        key_name(key)
+                    ));
+                }
+            }
+            return true;
+        }
+        if key.alt {
+            // Unbound Alt keys keep their system behavior (window menu).
+            let Some(def) = commands::for_key(key) else {
+                return false;
+            };
+            // Line and page commands act on the text: not from the find box
+            // or a popup (the palette can still run them by name).
+            let text_focus = !self.find_focused() && self.popup.is_none();
+            if text_focus || !commands::needs_text_focus(def.action) {
+                self.perform(def.action, ctx);
+            }
+            return true;
+        }
+        self.skip_space = false;
+        match self.popup {
+            Some(Popup::Palette(_)) => return self.palette_key(key, ctx),
+            Some(Popup::Panel(_)) => return self.panel_key(key, ctx),
+            None => {}
+        }
+        if self.find_focused() {
+            return self.find_key(key, ctx);
+        }
+        self.notice = None;
+        if self.find_open() && key.vk == VK_ESCAPE && !key.ctrl && !key.shift {
+            self.close_find();
+            return true;
+        }
+        if commands::starts_chord(key) {
+            self.start_chord(key);
+            return true;
+        }
+        if let Some(def) = commands::for_key(key) {
+            self.perform(def.action, ctx);
+            return true;
+        }
+        if self.no_file() {
+            return false;
+        }
+        self.edit_key(key)
+    }
+
+    /// Waits for the second key of a chord starting with `key`.
+    fn start_chord(&mut self, key: Key) {
+        self.chord = Some(key);
+        self.notice = Some(format!(
+            "({}) was pressed. Waiting for the second key of the chord\u{2026}",
+            key_name(key)
+        ));
+    }
+
+    /// Runs a registry command (from a key or the palette).
+    fn perform(&mut self, action: Action, ctx: &mut Ctx) {
+        if self.no_file() && !works_without_file(action) && action != Action::Close {
+            self.notice = Some("No file is open".to_owned());
+            return;
+        }
+        let (s, sels) = (&self.pane.doc.snapshot, &self.pane.doc.selections);
+        match action {
+            Action::Save => {
+                self.request_save();
+            }
+            Action::Close => self.close_file(),
+            Action::Quit => self.request_close(ctx),
+            Action::ToggleReadOnly => {
+                self.pane.doc.locks.user = !self.pane.doc.locks.user;
+                let state = if self.pane.doc.locks.user {
+                    "on"
+                } else {
+                    "off"
+                };
+                self.notice = Some(format!("Read-only {state}"));
+            }
+            Action::CopyFilePath => self.copy_file_path(false, ctx),
+            Action::CopyFileName => self.copy_file_path(true, ctx),
+            Action::Undo => self.undo_redo(false),
+            Action::Redo => self.undo_redo(true),
+            Action::Cut => self.copy(ctx, true),
+            Action::Copy => self.copy(ctx, false),
+            Action::Paste => self.paste(ctx),
+            Action::DeleteWordLeft => self.run(edit::delete_word_left(s, sels), None),
+            Action::DeleteWordRight => self.run(edit::delete_word_right(s, sels), None),
+            Action::Outdent => {
+                let cmd = edit::outdent(s, sels, &self.edit_options());
+                self.run(cmd, None);
+            }
+            Action::ToggleOvertype => {
+                self.pane.doc.options.overtype = !self.pane.doc.options.overtype
+            }
+            Action::SelectAll => self.select_single(Selection::new(0, s.len())),
+            Action::GoToTop | Action::SelectToTop => {
+                self.move_heads(action == Action::SelectToTop, |_, _| (0, None));
+            }
+            Action::GoToBottom | Action::SelectToBottom => {
+                self.move_heads(action == Action::SelectToBottom, |s, _| (s.len(), None));
+            }
+            Action::ScrollLineUp => self.scroll_rows(-1),
+            Action::ScrollLineDown => self.scroll_rows(1),
+            Action::ZoomIn => self.set_zoom(self.zoom + 1),
+            Action::ZoomOut => self.set_zoom(self.zoom - 1),
+            Action::ZoomReset => self.set_zoom(0),
+            Action::ShowCommands => self.open_palette(Mode::All),
+            Action::ShowFavorites => self.open_palette(Mode::Favorites),
+            Action::About => self.popup = Some(Popup::Panel(about_panel())),
+            Action::KeyboardShortcuts => self.popup = Some(Popup::Panel(shortcuts_panel())),
+            Action::Documentation => ctx.open_url(DOCUMENTATION_URL),
+            Action::ToggleSyntax => {
+                self.highlighting = !self.highlighting;
+                let state = if self.highlighting { "on" } else { "off" };
+                self.notice = Some(format!("Syntax highlighting {state}"));
+                self.restart_syntax();
+                self.with_other(Editor::restart_syntax);
+            }
+            Action::Find => self.open_find(false),
+            Action::Replace => self.open_find(true),
+            Action::FindNext => self.find_next(false),
+            Action::FindPrevious => self.find_next(true),
+            Action::ReplaceOne => self.replace_one(),
+            Action::ReplaceAll => self.replace_all(),
+            Action::SelectAllMatches => self.select_all_matches(),
+            Action::ToggleMatchCase
+            | Action::ToggleWholeWord
+            | Action::ToggleRegex
+            | Action::ToggleGlob
+            | Action::TogglePreserveCase => self.toggle_find_option(action),
+            Action::ToggleFindInSelection => self.toggle_find_in_selection(),
+            Action::AddNextOccurrence => self.add_next_occurrence(false),
+            Action::MoveToNextOccurrence => self.add_next_occurrence(true),
+            Action::SelectAllOccurrences | Action::ChangeAllOccurrences => {
+                self.select_all_occurrences();
+            }
+            Action::AddCursorAbove => self.add_cursor_vertical(-1),
+            Action::AddCursorBelow => self.add_cursor_vertical(1),
+            Action::CursorsAtLineEnds => self.cursors_at_line_ends(),
+            Action::ExpandLineSelection => self.expand_line_selection(),
+            Action::CursorUndo => self.cursor_undo(),
+            Action::ColumnSelectUp => self.column_select(-1, 0),
+            Action::ColumnSelectDown => self.column_select(1, 0),
+            Action::ColumnSelectLeft => self.column_select(0, -1),
+            Action::ColumnSelectRight => self.column_select(0, 1),
+            Action::ColumnSelectPageUp => self.column_select(-(self.page() as i64), 0),
+            Action::ColumnSelectPageDown => self.column_select(self.page() as i64, 0),
+            Action::ChangeLanguage => self.open_language_mode(),
+            Action::ToggleLineComment => self.comment(Some(edit::CommentMode::Toggle)),
+            Action::AddLineComment => self.comment(Some(edit::CommentMode::Add)),
+            Action::RemoveLineComment => self.comment(Some(edit::CommentMode::Remove)),
+            Action::ToggleBlockComment => self.comment(None),
+            Action::GoToBracket => self.go_to_bracket(),
+            Action::ExpandSelection => self.expand_selection(),
+            Action::ShrinkSelection => self.shrink_selection(),
+            Action::GoToSymbol => self.open_symbols(),
+            Action::MoveLineUp | Action::MoveLineDown => {
+                if let Some(coded) = edit::move_lines(s, sels, action == Action::MoveLineUp) {
+                    self.run_coded(coded, None);
+                }
+            }
+            Action::CopyLineUp | Action::CopyLineDown => {
+                let up = action == Action::CopyLineUp;
+                let coded = edit::copy_lines(s, sels, up, &self.edit_options());
+                self.run_coded(coded, None);
+            }
+            Action::DeleteLine => {
+                let coded = edit::delete_lines(s, sels, &self.edit_options());
+                self.run_coded(coded, None);
+            }
+            Action::InsertLineAbove | Action::InsertLineBelow => {
+                let below = action == Action::InsertLineBelow;
+                let coded = edit::insert_line(s, sels, below, &self.edit_options());
+                self.run_coded(coded, None);
+            }
+            Action::IndentLine => {
+                if let Some(coded) = edit::indent_lines(s, sels, &self.edit_options()) {
+                    self.run_coded(coded, None);
+                }
+            }
+            Action::ScrollPageUp => self.scroll_rows(-(self.page() as i64)),
+            Action::ScrollPageDown => self.scroll_rows(self.page() as i64),
+            Action::GoToLine => self.open_go_to_line(),
+            Action::ToggleFullScreen => self.toggle_full_screen(ctx),
+            Action::ToggleSpelling => self.toggle_spelling(),
+            Action::SpellingSuggestions => self.show_spelling(),
+            Action::NextMisspelling => self.next_misspelling(false),
+            Action::PreviousMisspelling => self.next_misspelling(true),
+            Action::AddToDictionary => self.add_word(false),
+            Action::IgnoreWord => self.add_word(true),
+            Action::FocusLeftPane => self.focus(Side::Left),
+            Action::FocusRightPane => self.focus(Side::Right),
+            Action::SwitchSide => self.focus(self.other.side),
+            Action::SwapSides => self.swap_sides(),
+            Action::ToggleDiffMode => self.toggle_diff_mode(),
+            Action::SaveAll => self.save_all(),
+            Action::NextChange => self.go_to_change(true),
+            Action::PreviousChange => self.go_to_change(false),
+            Action::CopyToRight => self.copy_change(Side::Right, false),
+            Action::CopyToLeft => self.copy_change(Side::Left, false),
+            Action::CopyToRightAndNext => self.copy_change(Side::Right, true),
+            Action::CopyToLeftAndNext => self.copy_change(Side::Left, true),
+            Action::ToggleIgnoreTrimWhitespace => self.toggle_trim_whitespace(),
+        }
+    }
+
+    /// Movement and editing keys that are not registry commands.
+    fn edit_key(&mut self, key: Key) -> bool {
+        let Key {
+            vk, ctrl, shift, ..
+        } = key;
+        let tab = self.options.tab_width;
+        let opts = self.edit_options();
+        match (vk, ctrl) {
+            (VK_LEFT, _) => self.move_heads(shift, |s, sel| {
+                if !shift && !sel.is_empty() && !ctrl {
+                    (sel.start(), None)
+                } else if ctrl {
+                    (edit::word_left(s, sel.head), None)
+                } else {
+                    (edit::prev_boundary(s, sel.head), None)
+                }
+            }),
+            (VK_RIGHT, _) => self.move_heads(shift, |s, sel| {
+                if !shift && !sel.is_empty() && !ctrl {
+                    (sel.end(), None)
+                } else if ctrl {
+                    (edit::word_right(s, sel.head), None)
+                } else {
+                    (edit::next_boundary(s, sel.head), None)
+                }
+            }),
+            (VK_UP | VK_DOWN, true) => self.scroll_rows(if vk == VK_UP { -1 } else { 1 }),
+            (VK_UP | VK_DOWN | VK_PRIOR | VK_NEXT, false) => {
+                let page = self.page() as i64;
+                let lines = match vk {
+                    VK_UP => -1,
+                    VK_DOWN => 1,
+                    VK_PRIOR => -page,
+                    _ => page,
+                };
+                if vk == VK_PRIOR || vk == VK_NEXT {
+                    self.scroll_rows(lines);
+                }
+                let mut walk = edit::Vertical::default();
+                self.move_heads(shift, |s, sel| {
+                    let (head, goal) = walk.step(s, sel.head, sel.goal, lines, tab);
+                    (head, Some(goal))
+                });
+            }
+            (VK_HOME, _) => self.move_heads(shift, |s, sel| {
+                (
+                    if ctrl {
+                        0
+                    } else {
+                        edit::line_home(s, sel.head)
+                    },
+                    None,
+                )
+            }),
+            (VK_END, _) => self.move_heads(shift, |s, sel| {
+                (
+                    if ctrl {
+                        s.len()
+                    } else {
+                        edit::line_end(s, sel.head)
+                    },
+                    None,
+                )
+            }),
+            (VK_ESCAPE, false) => {
+                let primary = self.pane.doc.selections.primary();
+                let collapsed = if self.pane.doc.selections.len() > 1 {
+                    primary
+                } else {
+                    Selection::caret(primary.head)
+                };
+                self.select_single(collapsed);
+            }
+            (VK_BACK, _) => {
+                if !ctrl && self.delete_pair() {
+                    return true;
+                }
+                let (s, sels) = (&self.pane.doc.snapshot, &self.pane.doc.selections);
+                let cmd = if ctrl {
+                    edit::delete_word_left(s, sels)
+                } else {
+                    edit::backspace(s, sels)
+                };
+                self.run(cmd, None);
+            }
+            (VK_DELETE, _) => {
+                let (s, sels) = (&self.pane.doc.snapshot, &self.pane.doc.selections);
+                let cmd = if ctrl {
+                    edit::delete_word_right(s, sels)
+                } else {
+                    edit::delete_forward(s, sels)
+                };
+                self.run(cmd, None);
+            }
+            (VK_RETURN, false) => {
+                if self.newline_indent() {
+                    return true;
+                }
+                let cmd = edit::newline(&self.pane.doc.snapshot, &self.pane.doc.selections, &opts);
+                self.run(Some(cmd), None);
+            }
+            (VK_TAB, false) => {
+                let cmd = edit::tab(&self.pane.doc.snapshot, &self.pane.doc.selections, &opts);
+                self.run(Some(cmd), None);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn typed(&mut self, ch: char) {
+        if self.pane.prompt.is_some() || self.closing.is_some() || ch < ' ' || ch == '\u{7F}' {
+            return;
+        }
+        if std::mem::take(&mut self.skip_space) && ch == ' ' {
+            return;
+        }
+        match &mut self.popup {
+            Some(Popup::Palette(p)) => {
+                let mut buf = [0u8; 4];
+                if p.query.insert(ch.encode_utf8(&mut buf)) {
+                    self.refresh_palette();
+                }
+                return;
+            }
+            Some(Popup::Panel(_)) => return,
+            None => {}
+        }
+        if self.find_focused() {
+            self.find_typed(ch);
+            return;
+        }
+        if self.no_file() {
+            return;
+        }
+        self.notice = None;
+        if self.auto_close(ch) {
+            return;
+        }
+        let opts = self.edit_options();
+        let mut buf = [0u8; 4];
+        let cmd = edit::insert(
+            &self.pane.doc.snapshot,
+            &self.pane.doc.selections,
+            ch.encode_utf8(&mut buf).as_bytes(),
+            &opts,
+        );
+        self.run(Some(cmd), Some(ch));
+    }
+
+    /// Starts the favorites store on first use; its file is read by a worker.
+    fn load_store(&mut self) {
+        if self.store.is_some() {
+            return;
+        }
+        self.store = Some(match &self.settings.user_dir {
+            Some(dir) => {
+                let wake = self.wake.clone();
+                let file = FileStorage(dir.join(favorites::FILE_NAME));
+                Store::spawn(file, move || wake())
+            }
+            None => Store::memory(),
+        });
+    }
+
+    /// Applies the store worker's replies; a problem becomes the notice.
+    fn drain_store(&mut self) {
+        let Some(store) = &mut self.store else {
+            return;
+        };
+        let rev = store.rev();
+        if let Some(problem) = store.drain() {
+            self.notice = Some(problem);
+        }
+        if store.rev() != rev
+            && let Some(Popup::Palette(p)) = &mut self.popup
+        {
+            p.refresh_in_place(store, self.settings.recent_count);
+        }
+    }
+
+    /// Opens the palette, or switches the open one to `mode`.
+    fn open_palette(&mut self, mode: Mode) {
+        self.load_store();
+        let Some(store) = &self.store else {
+            return;
+        };
+        let recent = self.settings.recent_count;
+        match &mut self.popup {
+            Some(Popup::Palette(p)) => {
+                p.mode = mode;
+                p.max_rows = None;
+                p.refresh(store, recent);
+            }
+            _ => self.popup = Some(Popup::Palette(Box::new(Palette::new(mode, store, recent)))),
+        }
+    }
+
+    /// Rebuilds the palette rows after the query changed.
+    fn refresh_palette(&mut self) {
+        if matches!(&self.popup, Some(Popup::Palette(p)) if p.mode == Mode::Line) {
+            self.update_go_to_line();
+            return;
+        }
+        if let (Some(Popup::Palette(p)), Some(store)) = (&mut self.popup, &self.store) {
+            p.refresh(store, self.settings.recent_count);
+        }
+    }
+
+    /// Popups do not zoom: their font size is the one of zoom 0.
+    fn ui_px(&self) -> f32 {
+        (BASE_PX * self.dpi as f32 / 96.0).round()
+    }
+
+    /// Keeps the popup font at [`Self::ui_px`]; created when a popup opens
+    /// while the editor is zoomed.
+    fn sync_ui_renderer(&mut self) {
+        let px = self.ui_px();
+        if self.renderer.px() == px {
+            self.ui_renderer = None;
+        } else if let Some(renderer) = &mut self.ui_renderer {
+            renderer.set_size(px);
+        } else if self.popup.is_some() || self.find_open() {
+            self.ui_renderer = Renderer::new(Cow::Borrowed(rtm_assets::DEFAULT_FONT), px).ok();
+        }
+    }
+
+    fn ui_cell(&self) -> Cell {
+        self.ui_renderer.as_ref().unwrap_or(&self.renderer).cell()
+    }
+
+    fn palette_geometry(&self, p: &Palette) -> PaletteGeometry {
+        let (w, h) = self.size;
+        let top = self.layout().title.h as i32;
+        PaletteGeometry::with_rows(
+            w,
+            h,
+            top,
+            self.ui_cell(),
+            p.items.len(),
+            p.max_rows.unwrap_or(PALETTE_ROWS),
+        )
+    }
+
+    fn panel_geometry(&self, panel: &Panel) -> PanelGeometry {
+        let (w, h) = self.size;
+        let top = self.layout().title.h as i32;
+        let cols = panel.lines.iter().map(PanelLine::cols).max().unwrap_or(0);
+        let icon = panel.icon.then(|| self.icon_side());
+        PanelGeometry::new(w, h, top, self.ui_cell(), cols, panel.lines.len(), icon)
+    }
+
+    /// First shown line of `panel`: at most the start of its last page, also
+    /// after the window grew.
+    fn panel_first(&self, panel: &Panel) -> usize {
+        let page = self.panel_geometry(panel).lines.max(1);
+        panel.first.min(panel.lines.len().saturating_sub(page))
+    }
+
+    fn icon_side(&self) -> u32 {
+        self.ui_cell().height * 4
+    }
+
+    /// Screen area of the open popup.
+    fn popup_area(&self) -> Option<rtm_view::Rect> {
+        match &self.popup {
+            Some(Popup::Palette(p)) => Some(self.palette_geometry(p).panel),
+            Some(Popup::Panel(panel)) => Some(self.panel_geometry(panel).panel),
+            None => None,
+        }
+    }
+
+    /// Fingerprint of what the open popup shows (repaint check).
+    fn popup_view(&self) -> u64 {
+        let mut h = DefaultHasher::new();
+        match &self.popup {
+            None => 0u8.hash(&mut h),
+            Some(Popup::Palette(p)) => {
+                1u8.hash(&mut h);
+                p.mode.hash(&mut h);
+                p.query.hash(&mut h);
+                (p.selected, p.first, p.items.len()).hash(&mut h);
+                self.store.as_ref().map(Store::rev).hash(&mut h);
+            }
+            Some(Popup::Panel(panel)) => {
+                2u8.hash(&mut h);
+                (panel.title, panel.first).hash(&mut h);
+            }
+        }
+        self.find_view(&mut h);
+        h.finish()
+    }
+
+    fn palette_key(&mut self, key: Key, ctx: &mut Ctx) -> bool {
+        let Some(Popup::Palette(p)) = &self.popup else {
+            return false;
+        };
+        let rows = self.palette_geometry(p).rows;
+        let selected = p.selected;
+        let Some(Popup::Palette(p)) = &mut self.popup else {
+            return false;
+        };
+        let (page, ctrl, shift) = (rows as isize, key.ctrl, key.shift);
+        let word = |word, char| if ctrl { word } else { char };
+        let mut edited = false;
+        match key.vk {
+            VK_ESCAPE => self.popup = None,
+            VK_RETURN if !ctrl => {
+                if let Some(item) = selected {
+                    self.run_palette_item(item, ctx);
+                }
+            }
+            VK_UP => p.move_selection(-1, rows),
+            VK_DOWN => p.move_selection(1, rows),
+            VK_PRIOR => p.move_selection(-page, rows),
+            VK_NEXT => p.move_selection(page, rows),
+            VK_LEFT => {
+                p.query
+                    .move_caret(word(Motion::WordLeft, Motion::Left), shift);
+            }
+            VK_RIGHT => {
+                p.query
+                    .move_caret(word(Motion::WordRight, Motion::Right), shift);
+            }
+            VK_HOME => {
+                p.query.move_caret(Motion::Home, shift);
+            }
+            VK_END => {
+                p.query.move_caret(Motion::End, shift);
+            }
+            VK_BACK => edited = p.query.delete(false, ctrl),
+            VK_DELETE => edited = p.query.delete(true, ctrl),
+            VK_A if ctrl && !shift => {
+                p.query.select_all();
+            }
+            VK_V if ctrl && !shift => {
+                // The first line of the clipboard text.
+                if let Some((text, _)) = ctx.clipboard(clip::FORMAT) {
+                    edited = p.query.insert(text.lines().next().unwrap_or_default());
+                }
+            }
+            VK_SPACE if ctrl && !shift => {
+                self.skip_space = true;
+                if let Some(item) = selected {
+                    self.toggle_favorite(item);
+                }
+            }
+            _ => self.popup_command(key, ctx),
+        }
+        if edited {
+            self.refresh_palette();
+        }
+        true
+    }
+
+    fn panel_key(&mut self, key: Key, ctx: &mut Ctx) -> bool {
+        let Some(Popup::Panel(panel)) = &self.popup else {
+            return false;
+        };
+        let page = self.panel_geometry(panel).lines.max(1);
+        let last = panel.lines.len().saturating_sub(page);
+        let current = self.panel_first(panel);
+        let first = match key.vk {
+            VK_ESCAPE => {
+                self.popup = None;
+                return true;
+            }
+            VK_UP => current.saturating_sub(1),
+            VK_DOWN => current + 1,
+            VK_PRIOR => current.saturating_sub(page),
+            VK_NEXT => current + page,
+            VK_HOME => 0,
+            VK_END => last,
+            _ => {
+                self.popup_command(key, ctx);
+                return true;
+            }
+        };
+        if let Some(Popup::Panel(panel)) = &mut self.popup {
+            panel.first = first.min(last);
+        }
+        true
+    }
+
+    /// Keys of popup commands keep working while a popup is open; other
+    /// commands wait until it closes.
+    fn popup_command(&mut self, key: Key, ctx: &mut Ctx) {
+        if let Some(def) = commands::for_key(key)
+            && matches!(
+                def.action,
+                Action::ShowCommands
+                    | Action::ShowFavorites
+                    | Action::About
+                    | Action::KeyboardShortcuts
+                    | Action::Quit
+            )
+        {
+            self.perform(def.action, ctx);
+        }
+    }
+
+    /// Closes the palette, records the command as recent and runs it. The
+    /// command runs before the state file is written. A choice (language,
+    /// symbol) is applied instead.
+    fn run_palette_item(&mut self, item: usize, ctx: &mut Ctx) {
+        let Some(Popup::Palette(p)) = &self.popup else {
+            return;
+        };
+        if let Some(choice) = p.choice_at(item) {
+            let (mode, query) = (p.mode, p.query.as_str().to_owned());
+            if mode == Mode::Spelling && self.spelling_row_inert(choice) {
+                return;
+            }
+            self.popup = None;
+            match mode {
+                Mode::Language => self.set_language(choice),
+                Mode::Symbol => self.go_to_symbol(choice),
+                Mode::Line => self.go_to_line(&query),
+                Mode::Spelling => self.run_spelling_row(choice),
+                Mode::All | Mode::Favorites => {}
+            }
+            return;
+        }
+        let (Some(def), Some(index)) = (p.command_at(item), p.index_at(item)) else {
+            return;
+        };
+        self.popup = None;
+        if let Some(store) = &mut self.store {
+            store.push_recent(index);
+        }
+        self.perform(def.action, ctx);
+    }
+
+    fn toggle_favorite(&mut self, item: usize) {
+        let (Some(Popup::Palette(p)), Some(store)) = (&mut self.popup, &mut self.store) else {
+            return;
+        };
+        let Some(index) = p.index_at(item) else {
+            return;
+        };
+        if !store.set_favorite(index, !store.is_favorite(index)) {
+            self.notice = Some(format!("At most {MAX_FAVORITES} favorites are kept"));
+        }
+        if p.mode == Mode::Favorites {
+            p.refresh_in_place(store, self.settings.recent_count);
+        }
+    }
+
+    fn popup_click(&mut self, x: i32, y: i32, ctx: &mut Ctx) {
+        let cell = self.ui_cell();
+        match &self.popup {
+            Some(Popup::Palette(p)) => {
+                let g = self.palette_geometry(p);
+                if !g.panel.contains(x, y) {
+                    self.popup = None;
+                } else if let Some(row) = g.row_at(x, y) {
+                    let item = p.first + row;
+                    if g.star_area(row, cell).contains(x, y) {
+                        self.toggle_favorite(item);
+                    } else {
+                        self.run_palette_item(item, ctx);
+                    }
+                }
+            }
+            Some(Popup::Panel(panel)) => {
+                let g = self.panel_geometry(panel);
+                if !g.panel.contains(x, y) {
+                    self.popup = None;
+                } else if let Some(line) = g.line_at(x, y)
+                    && let Some(Some(url)) = panel.links.get(self.panel_first(panel) + line)
+                {
+                    ctx.open_url(url);
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn popup_wheel(&mut self, delta: i32) {
+        let steps = -delta.signum() as isize * WHEEL_LINES as isize;
+        match &self.popup {
+            Some(Popup::Palette(p)) => {
+                let rows = self.palette_geometry(p).rows;
+                if let Some(Popup::Palette(p)) = &mut self.popup {
+                    p.scroll(steps, rows);
+                }
+            }
+            Some(Popup::Panel(panel)) => {
+                let page = self.panel_geometry(panel).lines;
+                let last = panel.lines.len().saturating_sub(page);
+                let current = self.panel_first(panel);
+                if let Some(Popup::Panel(panel)) = &mut self.popup {
+                    panel.first = current.saturating_add_signed(steps).min(last);
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn scale_about_icon(&mut self, side: u32) {
+        if self.about_icon.as_ref().is_some_and(|(s, _)| *s == side) {
+            return;
+        }
+        let source: Vec<u32> = ABOUT_ICON
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&b| u32::from_le_bytes(b))
+            .collect();
+        let from = (source.len() as f64).sqrt() as u32;
+        self.about_icon = Some((side, scale_image(&source, from, side).into()));
+    }
+
+    /// Adds the open popup to the display list.
+    fn draw_popup(&mut self) {
+        if matches!(&self.popup, Some(Popup::Panel(p)) if p.icon) {
+            self.scale_about_icon(self.icon_side());
+        }
+        let cell = self.ui_cell();
+        let theme = &self.theme;
+        match &self.popup {
+            Some(Popup::Palette(p)) => {
+                let g = self.palette_geometry(p);
+                let first = p.first.min(p.items.len());
+                let visible = &p.items[first..(first + g.rows).min(p.items.len())];
+                let (store, locks, has_path) =
+                    (&self.store, self.pane.doc.locks, self.pane.path.is_some());
+                let editable = self.editable_sides();
+                let rows = visible.iter().map(|item| match item {
+                    Item::Header(text) => PaletteRow::Header(text),
+                    Item::Separator => PaletteRow::Separator,
+                    Item::Command { index, matched } => {
+                        let def = &COMMANDS[*index];
+                        PaletteRow::Command {
+                            label: def.label,
+                            matched: p.matched(matched),
+                            keys: commands::key_hint(*index),
+                            star: Some(store.as_ref().is_some_and(|s| s.is_favorite(*index))),
+                            enabled: enabled(def, locks, has_path, editable),
+                        }
+                    }
+                    Item::Choice { index, matched } => PaletteRow::Command {
+                        label: &p.choices.labels[*index],
+                        matched: p.matched(matched),
+                        keys: &p.choices.hints[*index],
+                        star: None,
+                        enabled: true,
+                    },
+                });
+                let placeholder = match p.mode {
+                    Mode::All => "Type a command name",
+                    Mode::Favorites => "Search recent and favorite commands",
+                    Mode::Language => "Select a language",
+                    Mode::Symbol => "Go to a symbol",
+                    Mode::Line => "Line, line:column or -line from the end",
+                    Mode::Spelling => "Choose a suggestion or a spelling command",
+                };
+                let empty = match p.mode {
+                    Mode::Favorites if p.query.as_str().is_empty() => {
+                        "Star commands in Ctrl+Shift+P to add them here"
+                    }
+                    Mode::Language => "No matching languages",
+                    Mode::Symbol if self.pane.symbols_pending => "Collecting symbols…",
+                    Mode::Symbol if p.choices.labels.is_empty() => "No symbols found",
+                    Mode::Symbol => "No matching symbols",
+                    Mode::Spelling => "No matching suggestions",
+                    _ => "No matching commands",
+                };
+                let query = p.query.as_str();
+                let cols = |end: usize| query[..end].width() as u32;
+                let selection = p.query.selection();
+                let frame = PaletteFrame {
+                    cell,
+                    theme,
+                    query,
+                    caret: cols(p.query.caret()),
+                    selection: (cols(selection.start), cols(selection.end)),
+                    placeholder,
+                    empty,
+                    selected: p.selected.and_then(|s| s.checked_sub(first)),
+                };
+                draw_palette(&g, &frame, rows, &mut self.list.popup);
+            }
+            Some(Popup::Panel(panel)) => {
+                let g = self.panel_geometry(panel);
+                let first = self.panel_first(panel);
+                let frame = PanelFrame {
+                    cell,
+                    theme,
+                    title: panel.title,
+                    footer: panel.footer,
+                    lines: &panel.lines[first..],
+                    image: self
+                        .about_icon
+                        .as_ref()
+                        .filter(|_| panel.icon)
+                        .map(|(_, pixels)| pixels),
+                };
+                draw_panel(&g, &frame, &mut self.list.popup);
+            }
+            None => {
+                self.draw_find();
+                self.with_other(Editor::draw_find);
+            }
+        }
+    }
+
+    /// The offset under a point: a line's nearest boundary, or for a filler
+    /// row the position of its gap (the start of the line after it).
+    fn hit(&self, x: i32, y: i32) -> u64 {
+        let layout = self.layout();
+        let cell = self.renderer.cell();
+        let s = &self.pane.doc.snapshot;
+        let dy = y - layout.text.y;
+        if dy < 0 {
+            return 0;
+        }
+        let row = self.scroll.top_row + (dy / cell.height.max(1) as i32) as u64;
+        if row >= self.row_count() {
+            return s.len();
+        }
+        match self.row_cell(row) {
+            rtm_diff::Cell::Line(line) if line < s.line_count() => hit_line(
+                s,
+                &layout,
+                self.scroll.first_col,
+                cell,
+                &self.options,
+                line,
+                x,
+            ),
+            rtm_diff::Cell::Line(_) => s.len(),
+            rtm_diff::Cell::Filler { before } => s.line_start(before).unwrap_or(s.len()),
+        }
+    }
+
+    /// Whole line containing `pos`, including its line break.
+    fn line_span(&self, pos: u64) -> (u64, u64) {
+        let s = &self.pane.doc.snapshot;
+        let line = s.line_of(pos);
+        let start = s.line_start(line).unwrap_or(0);
+        (start, s.line_start(line + 1).unwrap_or(s.len()))
+    }
+
+    fn word_span(&self, pos: u64) -> (u64, u64) {
+        let r = edit::word_at(&self.pane.doc.snapshot, pos);
+        (r.start, r.end)
+    }
+
+    fn mouse_down(&mut self, x: i32, y: i32, clicks: u32, shift: bool, alt: bool, middle: bool) {
+        if self.pane.prompt.is_some() || self.closing.is_some() {
+            return;
+        }
+        if self.strip().is_some_and(|track| track.contains(x, y)) {
+            if let Some(slider) = self.slider() {
+                // A press off the slider centers it there.
+                let grab = if slider.contains(x, y) {
+                    y - slider.y
+                } else {
+                    slider.h as i32 / 2
+                };
+                self.drag = Some(Drag {
+                    unit: Unit::Char,
+                    origin: (0, 0),
+                    mode: DragMode::Slider { grab },
+                });
+                self.drag_slider(y - grab);
+            }
+            return;
+        }
+        if self.no_file() {
+            return;
+        }
+        if self.find_open() && self.find_click(x, y) {
+            return;
+        }
+        let layout = self.layout();
+        let body = layout.text.contains(x, y) || layout.gutter.contains(x, y);
+        if !body {
+            return;
+        }
+        self.notice = None;
+        if let Some(f) = &mut self.pane.find {
+            f.focus = None;
+        }
+        if middle || (alt && shift) {
+            let anchor = self.cell_at(x, y);
+            self.drag = Some(Drag {
+                unit: Unit::Char,
+                origin: (0, 0),
+                mode: DragMode::Column(anchor),
+            });
+            self.select_column(anchor, anchor);
+            return;
+        }
+        let pos = self.hit(x, y);
+        if !alt {
+            self.click_change(y);
+        }
+        if alt && clicks == 1 {
+            self.toggle_cursor(pos);
+            self.drag = Some(Drag {
+                unit: Unit::Char,
+                origin: (pos, pos),
+                mode: DragMode::Add,
+            });
+            return;
+        }
+        let (unit, origin) = match clicks {
+            1 if shift => {
+                let anchor = self.pane.doc.selections.primary().anchor;
+                (Unit::Char, (anchor, anchor))
+            }
+            1 => (Unit::Char, (pos, pos)),
+            2 => (Unit::Word, self.word_span(pos)),
+            _ => (Unit::Line, self.line_span(pos)),
+        };
+        self.drag = Some(Drag {
+            unit,
+            origin,
+            mode: DragMode::Single,
+        });
+        self.drag_to(pos);
+    }
+
+    fn drag_move(&mut self, x: i32, y: i32) {
+        match self.drag.map(|d| d.mode) {
+            Some(DragMode::Column(anchor)) => {
+                let head = self.cell_at(x, y);
+                self.place_column(anchor, head, false);
+            }
+            Some(DragMode::Slider { grab }) => self.drag_slider(y - grab),
+            Some(_) => {
+                let pos = self.hit(x, y);
+                self.drag_to(pos);
+            }
+            None => {}
+        }
+    }
+
+    fn drag_to(&mut self, pos: u64) {
+        let Some(Drag { unit, origin, mode }) = self.drag else {
+            return;
+        };
+        let span = match unit {
+            Unit::Char => (pos, pos),
+            Unit::Word => self.word_span(pos),
+            Unit::Line => self.line_span(pos),
+        };
+        let selection = if span.0 < origin.0 {
+            Selection::new(origin.1, span.0)
+        } else {
+            Selection::new(origin.0, span.1.max(origin.1).max(pos))
+        };
+        if mode == DragMode::Add {
+            let sels = &self.pane.doc.selections;
+            let mut all = sels.as_slice().to_vec();
+            all[sels.primary_index()] = selection;
+            let primary = sels.primary_index();
+            self.pane.doc.select(Selections::new(all, primary));
+        } else {
+            self.select_single(selection);
+        }
+        self.reveal();
+    }
+
+    /// The close question, naming every pane with unsaved changes.
+    fn close_question(&self) -> String {
+        let dirty: Vec<&Pane> = [Side::Left, Side::Right]
+            .map(|side| self.pane_of(side))
+            .into_iter()
+            .filter(|p| p.dirty())
+            .collect();
+        let names: Vec<String> = dirty
+            .iter()
+            .filter_map(|p| p.path.as_deref().map(display_name))
+            .collect();
+        let question = match (names.as_slice(), dirty.iter().any(|p| p.save_refused)) {
+            ([name], true) => format!("{name} is read-only. Save changes?"),
+            _ => format!("Save changes to {}?", names.join(" and ")),
+        };
+        format!("{question}   Enter: Save   D: Discard   Esc: Cancel")
+    }
+
+    fn status_text(&self) -> (String, String) {
+        if self.no_file() {
+            // The close question can stand on an empty pane (the other one
+            // has the unsaved changes).
+            let left = match self.pane.prompt {
+                Some(Prompt::DirtyClose(_)) => self.close_question(),
+                _ => self.notice.clone().unwrap_or_default(),
+            };
+            let mut right = vec![self.pane.side.name()];
+            if self.pane.doc.locks.user {
+                right.push("Read-only");
+            }
+            if self.diff_mode {
+                right.push("Diff mode");
+            }
+            if !self.settings.diff.ignore_trim_whitespace {
+                right.push(WHITESPACE_COMPARED);
+            }
+            if !self.highlighting {
+                right.push("Syntax off");
+            }
+            return (left, right.join("  \u{00B7}  "));
+        }
+        let name = self
+            .pane
+            .path
+            .as_deref()
+            .map(display_name)
+            .unwrap_or_default();
+        let left = match self.pane.prompt {
+            Some(Prompt::DirtyClose(_)) => self.close_question(),
+            Some(Prompt::Changed(_)) => match self.pane.doc.locks.save_refusal() {
+                None => format!("{name} changed on disk.   R: Reload   S: Save Current"),
+                Some(reason) => {
+                    format!("{name} changed on disk.   R: Reload   (cannot save: {reason})")
+                }
+            },
+            None if self.pane.saving.is_some() => "Saving\u{2026}".to_owned(),
+            None => match (&self.notice, &self.pane.status) {
+                (Some(notice), _) => notice.clone(),
+                (None, LoadStatus::Loading { loaded, total }) => {
+                    format!("Loading {}%", loaded * 100 / (*total).max(1))
+                }
+                (None, LoadStatus::Failed(error)) => format!("Read error: {error}"),
+                (None, LoadStatus::Ready) => match self.pane.info {
+                    Some(info) if info.new_file => "New file".to_owned(),
+                    Some(info) if info.malformed => "Malformed UTF-16, read-only".to_owned(),
+                    Some(info) if info.cr_breaks => {
+                        "Line breaks are CR only: the text is shown as one line".to_owned()
+                    }
+                    _ => self
+                        .spelling_hint()
+                        .or_else(|| self.comparison_text())
+                        .unwrap_or_else(|| {
+                            let n = self.pane.doc.snapshot.line_count();
+                            format!("{n} line{}", plural(n))
+                        }),
+                },
+            },
+        };
+
+        let s = &self.pane.doc.snapshot;
+        let primary = self.pane.doc.selections.primary();
+        let line = s.line_of(primary.head);
+        // Past the exactly scanned bytes the column is approximate.
+        let beyond = primary.head - s.line_start(line).unwrap_or(0) > ROW_SCAN_LIMIT as u64;
+        let mut right = vec![
+            self.pane.side.name().to_owned(),
+            format!(
+                "Ln {}, Col {}{}",
+                line + 1,
+                if beyond { "~" } else { "" },
+                self.caret_column(primary.head) + 1
+            ),
+        ];
+        if self.pane.doc.selections.len() > 1 {
+            right.push(format!("{} selections", self.pane.doc.selections.len()));
+        } else if !primary.is_empty() {
+            let range = primary.range();
+            let len = range.end - range.start;
+            right.push(if len <= COUNT_LIMIT {
+                let chars = String::from_utf8_lossy(&s.to_vec(range)).chars().count();
+                format!("{chars} selected")
+            } else {
+                format!("{len} bytes selected")
+            });
+        }
+        if let Some(info) = self.pane.info {
+            right.push(
+                match info.encoding {
+                    Encoding::Utf8 => "UTF-8",
+                    Encoding::Utf8Bom => "UTF-8 BOM",
+                    Encoding::Utf16Le => "UTF-16 LE",
+                    Encoding::Utf16Be => "UTF-16 BE",
+                }
+                .to_owned(),
+            );
+            right.push(
+                match info.line_ending {
+                    LineEnding::Lf => "LF",
+                    LineEnding::CrLf => "CRLF",
+                }
+                .to_owned(),
+            );
+        }
+        if self.pane.doc.options.overtype {
+            right.push("OVR".to_owned());
+        }
+        if !self.settings.diff.ignore_trim_whitespace {
+            right.push(WHITESPACE_COMPARED.to_owned());
+        }
+        if !self.highlighting {
+            right.push("Syntax off".to_owned());
+        } else if let Some(lang) = self.pane.language {
+            right.push(lang.name.to_owned());
+        }
+        if !self.pane.doc.locks.loading
+            && let Some(reason) = self.pane.doc.locks.edit_refusal()
+        {
+            right.push(format!("RO: {reason}"));
+        }
+        (left, right.join("  \u{00B7}  "))
+    }
+}
+
+impl Editor {
+    /// Applies the replies of the pane's workers.
+    fn drain_pane(&mut self) {
+        self.drain_pending();
+        self.drain_loads();
+        self.drain_saves();
+        self.drain_watcher();
+        self.drain_search();
+        self.drain_syntax();
+    }
+
+    /// Sends the pane's state to its workers.
+    fn sync_pane(&mut self) {
+        self.sync_syntax();
+        self.sync_spelling();
+        self.sync_watcher();
+    }
+
+    /// One question at a time: a pane checks the disk only while the other
+    /// asks nothing; the pane with a question takes the focus.
+    fn check_disks(&mut self) {
+        if self.other.prompt.is_none() {
+            self.check_disk();
+        }
+        if self.pane.prompt.is_none() {
+            self.with_other(Editor::check_disk);
+        }
+        if self.pane.prompt.is_none() && self.other.prompt.is_some() {
+            self.focus(self.other.side);
+        }
+    }
+
+    /// What both panes show (repaint check).
+    fn visible_pair(&mut self) -> (Visible, Visible) {
+        let focused = self.visible();
+        (focused, self.with_other(|e| e.visible()))
+    }
+
+    /// Wheel rotation: rows of both panes, or columns with `Shift`.
+    fn wheel_scroll(&mut self, delta: i32, horizontal: bool, shift: bool) {
+        if horizontal || shift {
+            // Positive horizontal wheel delta scrolls right; vertical with Shift mirrors it.
+            let delta = if horizontal { delta } else { -delta };
+            self.wheel.1 += delta;
+            let notches = self.wheel.1 / WHEEL_NOTCH;
+            self.wheel.1 %= WHEEL_NOTCH;
+            self.scroll_cols(i64::from(notches * WHEEL_COLUMNS));
+        } else {
+            self.wheel.0 += delta;
+            let notches = self.wheel.0 * WHEEL_LINES / WHEEL_NOTCH;
+            self.wheel.0 -= notches * WHEEL_NOTCH / WHEEL_LINES;
+            self.scroll_rows(-i64::from(notches));
+        }
+    }
+
+    /// The header of the pane of `side`: its folder and name, the unsaved
+    /// marker and the read-only state.
+    fn header_parts(&self, side: Side) -> (String, String, Option<u32>, bool) {
+        let pane = self.pane_of(side);
+        let (dir, name) = match pane.path.as_deref() {
+            Some(path) => {
+                let full = path.display().to_string();
+                let name = display_name(path);
+                let dir = full.strip_suffix(name.as_str()).unwrap_or("").to_owned();
+                (dir, name)
+            }
+            None => (String::new(), String::new()),
+        };
+        let mark = pane.dirty().then_some(if pane.save_refused {
+            self.theme.warning
+        } else {
+            self.theme.unsaved
+        });
+        let locks = pane.doc.locks;
+        (
+            dir,
+            name,
+            mark,
+            pane.path.is_some() && (locks.user || locks.diff),
+        )
+    }
+
+    /// Adds the focused pane (or, with `focused` false, the other one while
+    /// it is swapped in) to the display list.
+    fn paint_pane(&mut self, focused: bool) {
+        let cell = self.renderer.cell();
+        let layout = self.layout();
+        let caret = if !focused || self.pane.prompt.is_some() || self.no_file() {
+            CaretStyle::Hidden
+        } else if self.pane.doc.options.overtype {
+            CaretStyle::Underline
+        } else {
+            CaretStyle::Bar
+        };
+        self.sync_syntax();
+        let slider_active = self.slider_active();
+        if layout.scrollbar.w > 0 {
+            self.refresh_marks(layout.scrollbar.h);
+        }
+        let brackets: Vec<u64> = self
+            .bracket_pair()
+            .map(|(a, b)| vec![a.min(b), a.max(b)])
+            .unwrap_or_default();
+        let ranges = match self.pane.syntax {
+            Some(_) => self.visible_ranges(),
+            None => Vec::new(),
+        };
+        let syntax = match &mut self.pane.syntax {
+            Some(syntax) => syntax.spans(&self.pane.doc.snapshot, &ranges),
+            None => &[],
+        };
+        let spelling: &[std::ops::Range<u64>] = match &self.pane.spell {
+            Some(spell) if self.spell_on => &spell.ranges,
+            _ => &[],
+        };
+        let inactive;
+        let theme = if focused {
+            &self.theme
+        } else {
+            inactive = Theme {
+                selection: self.theme.selection_inactive,
+                ..self.theme.clone()
+            };
+            &inactive
+        };
+        let rows = compare::rows_of(
+            &self.compare,
+            self.pane.side,
+            self.scroll.top_row,
+            layout.rows,
+        );
+        let overview = match layout.scrollbar.w {
+            0 => &[],
+            _ => self.compare.marks(),
+        };
+        let frame = Frame {
+            snapshot: &self.pane.doc.snapshot,
+            layout: &layout,
+            scroll: self.scroll,
+            rows: &rows,
+            row_count: self.compare.alignment().rows(),
+            overview,
+            cell,
+            theme,
+            chrome: Chrome::default(),
+            options: &self.options,
+            selections: self.pane.doc.selections.as_slice(),
+            caret,
+            highlights: {
+                let (matches, scope) =
+                    find::highlights(self.pane.find.as_deref(), &self.pane.doc.snapshot);
+                Highlights {
+                    matches,
+                    scope,
+                    syntax,
+                    brackets: &brackets,
+                    spelling,
+                }
+            },
+            empty: self.pane.path.is_none().then_some(EMPTY_HINT),
+            slider_active,
+        };
+        self.view.build_pane(&frame, &mut self.list);
+    }
+}
+
+impl App for Editor {
+    fn event(&mut self, event: Event, ctx: &mut Ctx) -> bool {
+        self.size = ctx.size();
+        // Pointer moves without a button only matter for search-box tooltips
+        // and for the pane the wheel scrolls.
+        match event {
+            Event::Hover { x, y } => {
+                if self.find_open() || self.tip.hit.is_some() {
+                    self.hover(x, y, ctx);
+                }
+                return false;
+            }
+            Event::MouseLeave => {
+                if std::mem::take(&mut self.tip).shown {
+                    ctx.redraw();
+                }
+                return false;
+            }
+            Event::Timer => {
+                self.show_tooltip(ctx);
+                return true;
+            }
+            _ => {}
+        }
+        let before = self.visible_pair();
+        if matches!(
+            event,
+            Event::Key(_) | Event::Char(_) | Event::MouseDown { .. } | Event::Wheel { .. }
+        ) {
+            self.tip = find::Tip::default();
+        }
+        let layout_changed = matches!(event, Event::Shown | Event::Resized { .. });
+        let mut handled = true;
+        match event {
+            Event::Shown => {
+                self.trace.mark("first_frame");
+                if !self.settings.exit_after_load && !self.settings.exit_after_highlight {
+                    self.trace.report();
+                }
+                if self.settings.exit_after_first_frame {
+                    ctx.close();
+                }
+                self.shown = true;
+                self.exit_if_ready(ctx);
+            }
+            Event::Resized { .. } => {}
+            Event::DpiChanged(dpi) => {
+                self.dpi = dpi;
+                let px = self.px();
+                self.renderer.set_size(px);
+            }
+            Event::Key(key) => {
+                if let Some(bench) = &mut self.bench {
+                    bench.arrived(bench::Step::Key(key));
+                }
+                handled = self.key(key, ctx);
+            }
+            Event::Char(ch) => {
+                if let Some(bench) = &mut self.bench {
+                    bench.arrived(bench::Step::Char(ch));
+                }
+                self.typed(ch);
+            }
+            Event::Wheel {
+                delta,
+                horizontal,
+                shift,
+                ctrl,
+            } => {
+                if self.popup.is_some() {
+                    self.popup_wheel(delta);
+                } else if ctrl && !horizontal {
+                    self.set_zoom(self.zoom + delta.signum());
+                } else {
+                    self.wheel_scroll(delta, horizontal, shift);
+                }
+            }
+            Event::MouseDown {
+                x,
+                y,
+                clicks,
+                shift,
+                alt,
+                middle,
+                ..
+            } => {
+                if self.popup.is_some() {
+                    if !middle {
+                        self.popup_click(x, y, ctx);
+                    }
+                } else {
+                    // A press in a pane gives it the focus (not while a
+                    // question or a close waits); the scroll strip and the
+                    // divider belong to both.
+                    let free = self.pane.prompt.is_none() && self.closing.is_none();
+                    if free && !middle && self.divider_click(x, y) {
+                    } else {
+                        if free
+                            && !self.strip().is_some_and(|track| track.contains(x, y))
+                            && let Some(side) = self.side_at(x, y)
+                        {
+                            self.focus(side);
+                        }
+                        self.mouse_down(x, y, clicks, shift, alt, middle);
+                    }
+                }
+            }
+            Event::MouseMove { x, y } => {
+                if self.drag.is_some() {
+                    self.drag_move(x, y);
+                }
+            }
+            Event::MouseUp => self.drag = None,
+            Event::CloseRequested => self.request_close(ctx),
+            Event::FilesDropped(dropped) => self.files_dropped(dropped),
+            Event::Hover { .. } | Event::MouseLeave | Event::Timer => {}
+            Event::FullScreen(Ok(on)) => self.full_screen = on,
+            Event::FullScreen(Err(reason)) => {
+                self.notice = Some(format!("Full screen failed: {reason}"));
+            }
+            Event::Wake => {
+                self.drain_pane();
+                self.with_other(Editor::drain_pane);
+                self.drain_spelling();
+                self.drain_diff();
+                self.drain_store();
+                self.pump_saves();
+                self.settle_close(ctx);
+                self.exit_if_ready(ctx);
+            }
+        }
+        self.refresh_alignment();
+        self.sync_pane();
+        self.with_other(Editor::sync_pane);
+        self.check_disks();
+        let title = window_title(
+            self.pane_of(Side::Left).path.as_deref(),
+            self.pane_of(Side::Right).path.as_deref(),
+            self.pane.dirty() || self.other.dirty(),
+        );
+        if title != self.shown_title {
+            ctx.set_title(&title);
+            self.shown_title = title;
+        }
+        if self.pane.prompt.is_some() {
+            self.popup = None;
+        }
+        self.end_line_preview();
+        self.sync_find();
+        self.with_other(Editor::sync_find);
+        self.sync_diff();
+        self.clamp_scroll();
+        self.sync_ui_renderer();
+        let after = self.visible_pair();
+        let redraw = layout_changed || !after.0.same(&before.0) || !after.1.same(&before.1);
+        if redraw {
+            ctx.redraw();
+        }
+        let busy = self.bench.is_some()
+            && (self.search_busy()
+                || self.pane.symbols_pending
+                || self.spelling_busy()
+                || self.comparing());
+        // Scripts start once the files are loaded and compared and, with
+        // syntax, highlighted.
+        let full = self.bench.as_ref().is_some_and(bench::Driver::full);
+        let ready = self.shown
+            && self.loaded_and_compared()
+            && self.pane.syntax.as_ref().is_none_or(|s| {
+                if full {
+                    s.fully_highlighted()
+                } else {
+                    s.highlighted()
+                }
+            })
+            && (self.bench.is_none() || !self.spelling_busy());
+        if ready && let Some(r) = self.bench.as_mut().and_then(bench::Driver::take_select) {
+            let len = self.pane.doc.snapshot.len();
+            self.pane.doc.select(Selections::single(Selection::new(
+                r.start.min(len),
+                r.end.min(len),
+            )));
+            ctx.redraw();
+        }
+        if let Some(bench) = &mut self.bench {
+            bench.check_frame(redraw, busy, ctx);
+            if ready {
+                bench.send(ctx);
+            }
+        }
+        handled
+    }
+
+    fn paint(&mut self, pixels: &mut [u32], width: u32, height: u32) {
+        self.size = (width, height);
+        self.refresh_alignment();
+        let cell = self.renderer.cell();
+        let (left, right) = self.status_text();
+        let layouts = [self.layout_of(Side::Left), self.layout_of(Side::Right)];
+        let parts = [
+            self.header_parts(Side::Left),
+            self.header_parts(Side::Right),
+        ];
+        let header = |i: usize, side: Side| Header {
+            dir: &parts[i].0,
+            name: &parts[i].1,
+            mark: parts[i].2,
+            read_only: parts[i].3,
+            focused: side == self.pane.side,
+        };
+        let headers = [header(0, Side::Left), header(1, Side::Right)];
+        let arrows = self.arrows();
+        self.view.build_split_chrome(
+            &SplitFrame {
+                layouts: [&layouts[0], &layouts[1]],
+                cell,
+                theme: &self.theme,
+                headers,
+                app_name: APP_NAME,
+                status_left: &left,
+                status_right: &right,
+                prompt: self.pane.prompt.is_some(),
+                arrows: &arrows,
+            },
+            &mut self.list,
+        );
+        self.paint_pane(true);
+        self.with_other(|e| e.paint_pane(false));
+        self.draw_popup();
+        let mut target = Target {
+            pixels,
+            width,
+            height,
+        };
+        self.renderer.draw(&self.list, &mut target);
+        let ui = self.ui_renderer.as_mut().unwrap_or(&mut self.renderer);
+        ui.draw_layer(&self.list.popup, &mut target);
+        ui.draw_layer(&self.list.tooltip, &mut target);
+        if !self.painted {
+            self.painted = true;
+            self.trace.mark("first_paint");
+        }
+    }
+
+    fn presented(&mut self, ctx: &mut Ctx) {
+        self.mark_highlights();
+        self.exit_if_ready(ctx);
+        let busy = self.bench.is_some()
+            && (self.search_busy()
+                || self.pane.symbols_pending
+                || self.spelling_busy()
+                || self.comparing());
+        let highlighted = self.pane.syntax.as_ref().map(Syntax::highlighted);
+        if let Some(bench) = &mut self.bench {
+            bench.presented(busy, highlighted, ctx);
+        }
+    }
+
+    fn is_caption(&self, x: i32, y: i32) -> bool {
+        self.layout().title.contains(x, y)
+    }
+
+    fn is_text(&self, x: i32, y: i32) -> bool {
+        let Some(side) = self.side_at(x, y) else {
+            return false;
+        };
+        self.pane_of(side).path.is_some()
+            && self.layout_of(side).text.contains(x, y)
+            && !self.popup_area().is_some_and(|r| r.contains(x, y))
+            && !(side == self.pane.side
+                && self
+                    .find_geometry()
+                    .is_some_and(|g| g.panel.contains(x, y) || g.message.contains(x, y)))
+    }
+}
+
+/// Whether `def` can run under the focused pane's `locks`; without a file
+/// only the commands of the empty state run. A copy runs while its target
+/// pane is editable (`editable`: left, right), whatever the focused pane's
+/// locks.
+fn enabled(def: &CommandDef, locks: Locks, has_path: bool, editable: [bool; 2]) -> bool {
+    if !has_path {
+        return works_without_file(def.action);
+    }
+    match def.action {
+        Action::Save => locks.save_refusal().is_none(),
+        Action::CopyToLeft | Action::CopyToLeftAndNext => editable[0],
+        Action::CopyToRight | Action::CopyToRightAndNext => editable[1],
+        _ => !def.mutates || locks.edit_refusal().is_none(),
+    }
+}
+
+/// The About panel: name, version, links and the manifest.
+fn about_panel() -> Panel {
+    let centered = |spans: &[(&str, Tone)]| PanelLine {
+        centered: true,
+        ..PanelLine::new(spans)
+    };
+    let mut lines = vec![
+        centered(&[(APP_NAME, Tone::Normal)]),
+        centered(&[("Version ", Tone::Dim), (VERSION, Tone::Normal)]),
+        PanelLine::default(),
+        PanelLine::new(&[("Repository     ", Tone::Dim), (REPOSITORY_URL, Tone::Link)]),
+        PanelLine::new(&[
+            ("Documentation  ", Tone::Dim),
+            (DOCUMENTATION_URL, Tone::Link),
+        ]),
+        PanelLine::default(),
+    ];
+    let mut links = vec![
+        None,
+        None,
+        None,
+        Some(REPOSITORY_URL),
+        Some(DOCUMENTATION_URL),
+    ];
+    for line in MANIFEST.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        lines.push(match line.strip_prefix('#') {
+            Some(title) => centered(&[(title.trim_start_matches('#').trim(), Tone::Heading)]),
+            None => centered(&[(line, Tone::Normal)]),
+        });
+    }
+    links.resize(lines.len(), None);
+    Panel {
+        title: "About",
+        footer: "Click a link to open it  \u{00B7}  Esc: Close",
+        lines,
+        links,
+        icon: true,
+        first: 0,
+    }
+}
+
+/// The Keyboard Shortcuts panel: every command with its keys, then the
+/// editing keys.
+fn shortcuts_panel() -> Panel {
+    let width = COMMANDS
+        .iter()
+        .map(|c| c.label.len())
+        .chain(EDITING_KEYS.iter().map(|(name, _)| name.len()))
+        .max()
+        .unwrap_or(0)
+        + 3;
+    let row = |name: &str, keys: &str, tone: Tone, keys_tone: Tone| {
+        PanelLine::new(&[(&format!("{name:<width$}"), tone), (keys, keys_tone)])
+    };
+    let mut lines = vec![row("Command", "Keys", Tone::Heading, Tone::Heading)];
+    for c in COMMANDS {
+        let keys = commands::keys_text(c);
+        lines.push(if keys.is_empty() {
+            row(c.label, "Palette only", Tone::Normal, Tone::Dim)
+        } else {
+            row(c.label, &keys, Tone::Normal, Tone::Normal)
+        });
+    }
+    lines.push(PanelLine::default());
+    lines.push(row("Editing", "Keys", Tone::Heading, Tone::Heading));
+    for (name, keys) in EDITING_KEYS {
+        lines.push(row(name, keys, Tone::Normal, Tone::Normal));
+    }
+    Panel {
+        title: "Keyboard Shortcuts",
+        footer: "Up, Down, PgUp, PgDn: Scroll  \u{00B7}  Esc: Close",
+        links: Vec::new(),
+        icon: false,
+        first: 0,
+        lines,
+    }
+}
+
+/// Resizes a square image of premultiplied pixels with a box filter.
+fn scale_image(source: &[u32], from: u32, to: u32) -> Vec<u32> {
+    let span = |i: u32| {
+        let start = i * from / to;
+        (start, ((i + 1) * from / to).max(start + 1))
+    };
+    let mut out = Vec::with_capacity((to * to) as usize);
+    for y in 0..to {
+        let (y0, y1) = span(y);
+        for x in 0..to {
+            let (x0, x1) = span(x);
+            let mut sum = [0u32; 4];
+            for sy in y0..y1 {
+                for sx in x0..x1 {
+                    let p = source[(sy * from + sx) as usize];
+                    for (k, s) in sum.iter_mut().enumerate() {
+                        *s += (p >> (24 - 8 * k)) & 0xFF;
+                    }
+                }
+            }
+            let n = (y1 - y0) * (x1 - x0);
+            let pixel = sum
+                .iter()
+                .enumerate()
+                .fold(0, |acc, (k, s)| acc | ((s + n / 2) / n) << (24 - 8 * k));
+            out.push(pixel);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+#[allow(clippy::single_range_in_vec_init)]
+mod tests {
+    use super::*;
+    use std::borrow::Cow;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use crate::save::fake::FakeFiles;
+
+    fn path() -> PathBuf {
+        PathBuf::from(r"C:\docs\test.txt")
+    }
+
+    fn renderer() -> Renderer {
+        Renderer::new_with_bold(
+            Cow::Borrowed(rtm_assets::DEFAULT_FONT),
+            Cow::Borrowed(rtm_assets::BOLD_FONT),
+            14.0,
+        )
+        .unwrap()
+    }
+
+    fn settings(read_only: bool, exit_after_load: bool) -> Settings {
+        Settings {
+            read_only,
+            diff_mode: false,
+            exit_after_first_frame: false,
+            exit_after_load,
+            exit_after_highlight: false,
+            recent_count: 3,
+            multi_cursor_limit: 10_000,
+            replace_all_max_mib: 512,
+            user_dir: None,
+            notice: None,
+            highlighting: true,
+            syntax: None,
+            syntax_max_mib: 32,
+            injections: true,
+            spelling: false,
+            spelling_engine: crate::spelling::Engine::Builtin,
+            hunspell: PathBuf::new(),
+            early_syntax: None,
+            bench: None,
+            diff: DiffSettings::default(),
+        }
+    }
+
+    fn info() -> FileInfo {
+        FileInfo {
+            encoding: Encoding::Utf8,
+            line_ending: LineEnding::Lf,
+            indent_tabs: false,
+            malformed: false,
+            cr_breaks: false,
+            new_file: false,
+        }
+    }
+
+    fn done(text: &[u8]) -> LoadEvent {
+        LoadEvent::Done {
+            snapshot: Snapshot::from_bytes(text),
+            info: info(),
+            baseline: None,
+            read_ms: 0.0,
+        }
+    }
+
+    fn loading_editor(first: Option<LoadEvent>, loads: Receiver<LoadEvent>) -> Editor {
+        Editor::new(
+            Some(&path()),
+            first,
+            Some(Load::new(loads)),
+            renderer(),
+            96,
+            settings(false, true),
+            Trace::new(false),
+            Arc::new(FakeFiles::default()),
+            Arc::new(|| {}),
+        )
+    }
+
+    /// An editor on `text`, stored in `files` at [`path`].
+    fn editor_on(files: &Arc<FakeFiles>, text: &[u8], read_only: bool) -> Editor {
+        files.put(&path(), text);
+        let (tx, rx) = mpsc::channel();
+        tx.send(LoadEvent::Done {
+            snapshot: Snapshot::from_bytes(text),
+            info: info(),
+            baseline: Some(files.baseline(&path())),
+            read_ms: 0.0,
+        })
+        .unwrap();
+        drop(tx);
+        Editor::new(
+            Some(&path()),
+            None,
+            Some(Load::new(rx)),
+            renderer(),
+            96,
+            settings(read_only, false),
+            Trace::new(false),
+            files.clone(),
+            Arc::new(|| {}),
+        )
+    }
+
+    fn text(editor: &Editor) -> String {
+        String::from_utf8(
+            editor
+                .pane
+                .doc
+                .snapshot
+                .to_vec(0..editor.pane.doc.snapshot.len()),
+        )
+        .unwrap()
+    }
+
+    fn key(vk: u16, ctrl: bool, shift: bool) -> Event {
+        Event::Key(Key {
+            vk,
+            ctrl,
+            shift,
+            alt: false,
+        })
+    }
+
+    fn type_text(editor: &mut Editor, ctx: &mut Ctx, text: &str) {
+        for ch in text.chars() {
+            editor.event(Event::Char(ch), ctx);
+        }
+    }
+
+    /// Delivers wake-ups until the running save finished.
+    fn settle(editor: &mut Editor, ctx: &mut Ctx) {
+        for _ in 0..5000 {
+            if editor.pane.saving.is_none() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            editor.event(Event::Wake, ctx);
+        }
+        panic!("save did not finish");
+    }
+
+    #[test]
+    fn loader_finished_before_the_waker_is_applied_at_startup() {
+        // Progress and Done are both queued before any wake-up could be delivered.
+        let (tx, rx) = mpsc::channel();
+        tx.send(LoadEvent::Progress {
+            snapshot: Snapshot::from_bytes(b"pre"),
+            loaded: 3,
+            total: 6,
+        })
+        .unwrap();
+        tx.send(done(b"prefix")).unwrap();
+        let first = rx.recv().ok();
+        let mut editor = loading_editor(first, rx);
+        assert!(matches!(editor.pane.status, LoadStatus::Ready));
+        assert!(!editor.pane.doc.locks.loading);
+        assert_eq!(text(&editor), "prefix");
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Shown, &mut ctx);
+        assert!(ctx.close_requested(), "--exit-after-load must close");
+    }
+
+    #[test]
+    fn loader_that_stops_without_a_final_event_is_reported() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(LoadEvent::Progress {
+            snapshot: Snapshot::from_bytes(b"part"),
+            loaded: 4,
+            total: 100,
+        })
+        .unwrap();
+        drop(tx);
+        let first = rx.recv().ok();
+        let editor = loading_editor(first, rx);
+        assert!(matches!(editor.pane.status, LoadStatus::Failed(_)));
+        assert!(editor.pane.doc.locks.load_error);
+        assert_eq!(editor.pane.doc.snapshot.len(), 4);
+    }
+
+    #[test]
+    fn late_events_are_applied_on_wake() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(LoadEvent::Progress {
+            snapshot: Snapshot::from_bytes(b"a"),
+            loaded: 1,
+            total: 2,
+        })
+        .unwrap();
+        let first = rx.recv().ok();
+        let mut editor = loading_editor(first, rx);
+        assert!(matches!(editor.pane.status, LoadStatus::Loading { .. }));
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Shown, &mut ctx);
+        assert!(!ctx.close_requested(), "the file loads");
+        editor.event(Event::Char('x'), &mut ctx);
+        assert_eq!(text(&editor), "a", "the loading prefix is read-only");
+        tx.send(done(b"ab")).unwrap();
+        editor.event(Event::Wake, &mut ctx);
+        assert!(matches!(editor.pane.status, LoadStatus::Ready));
+        assert!(ctx.close_requested());
+    }
+
+    #[test]
+    fn typing_moving_and_undo() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"one\ntwo", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(key(VK_END, false, false), &mut ctx);
+        type_text(&mut editor, &mut ctx, "ab cd");
+        assert_eq!(text(&editor), "oneab cd\ntwo");
+        assert_eq!(
+            ctx.requested_title(),
+            Some(format!("\u{25CF} test.txt - {APP_NAME}").as_str())
+        );
+        editor.event(key(VK_DOWN, false, true), &mut ctx);
+        assert_eq!(
+            editor.pane.doc.selections.primary(),
+            Selection {
+                anchor: 8,
+                head: 12,
+                goal: Some(8)
+            }
+        );
+        editor.event(key(VK_RETURN, false, false), &mut ctx);
+        assert_eq!(text(&editor), "oneab cd\n");
+        editor.event(key(VK_Z, true, false), &mut ctx);
+        assert_eq!(text(&editor), "oneab cd\ntwo");
+        editor.event(key(VK_Z, true, false), &mut ctx);
+        editor.event(key(VK_Z, true, false), &mut ctx);
+        assert_eq!(text(&editor), "one\ntwo");
+        assert_eq!(
+            ctx.requested_title(),
+            Some(format!("test.txt - {APP_NAME}").as_str())
+        );
+        editor.event(key(VK_Y, true, false), &mut ctx);
+        assert_eq!(text(&editor), "oneab \ntwo");
+    }
+
+    #[test]
+    fn read_only_refuses_edits_with_a_notice() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"abc", true);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        type_text(&mut editor, &mut ctx, "x");
+        editor.event(key(VK_DELETE, false, false), &mut ctx);
+        assert_eq!(text(&editor), "abc");
+        assert_eq!(editor.notice.as_deref(), Some("Not editable: read-only"));
+        assert!(editor.status_text().1.contains("RO: read-only"));
+        editor.event(key(VK_RIGHT, false, true), &mut ctx);
+        assert_eq!(editor.pane.doc.selections.primary(), Selection::new(0, 1));
+    }
+
+    #[test]
+    fn line_copy_and_paste_through_the_clipboard() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"one\ntwo", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(key(VK_C, true, false), &mut ctx);
+        editor.event(key(VK_DOWN, false, false), &mut ctx);
+        editor.event(key(VK_V, true, false), &mut ctx);
+        assert_eq!(text(&editor), "one\none\ntwo");
+        editor.event(key(VK_X, true, false), &mut ctx);
+        assert_eq!(text(&editor), "one\none");
+        editor.event(key(VK_A, true, false), &mut ctx);
+        editor.event(key(VK_V, true, false), &mut ctx);
+        assert_eq!(text(&editor), "two\n");
+    }
+
+    #[test]
+    fn starting_without_a_file_shows_the_empty_state() {
+        let mut editor = empty_editor(false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Shown, &mut ctx);
+        assert!(editor.no_file() && editor.pane.doc.locks.no_file);
+        assert_eq!(window_title(None, None, false), APP_NAME);
+        // Typing, clicks and editing commands change nothing.
+        type_text(&mut editor, &mut ctx, "x");
+        editor.event(click(200, 200), &mut ctx);
+        editor.event(key(VK_V, true, false), &mut ctx);
+        assert!(editor.pane.doc.snapshot.is_empty());
+        editor.event(key(VK_S, true, false), &mut ctx);
+        assert!(editor.pane.saving.is_none());
+        assert_eq!(editor.notice.as_deref(), Some("No file is open"));
+        editor.event(key(VK_F, true, false), &mut ctx);
+        assert!(!editor.find_open());
+        // Close keeps the window; the palette dims all but the empty-state commands.
+        editor.event(key(VK_W, true, false), &mut ctx);
+        assert!(editor.notice.as_deref().unwrap().contains("Alt+F4"));
+        assert!(!ctx.close_requested());
+        let locks = editor.pane.doc.locks;
+        for def in COMMANDS {
+            assert_eq!(
+                enabled(def, locks, false, [false; 2]),
+                works_without_file(def.action),
+                "{}",
+                def.label
+            );
+        }
+        let (left, right) = editor.status_text();
+        assert!(left.contains("Alt+F4"), "the notice: {left}");
+        assert_eq!(
+            right, "Left",
+            "only the side: no position, encoding or language"
+        );
+        // Quit needs no answer.
+        editor.event(key(VK_W, true, true), &mut ctx);
+        assert!(ctx.close_requested());
+        let mut editor = empty_editor(false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::CloseRequested, &mut ctx);
+        assert!(ctx.close_requested());
+    }
+
+    #[test]
+    fn save_writes_and_cleans() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"abc", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        type_text(&mut editor, &mut ctx, "x");
+        editor.event(key(VK_S, true, false), &mut ctx);
+        settle(&mut editor, &mut ctx);
+        assert_eq!(files.get(&path()).unwrap(), b"xabc");
+        assert!(!editor.pane.doc.is_dirty());
+        assert_eq!(editor.notice.as_deref(), Some("Saved"));
+        assert_eq!(editor.pane.baseline, Some(files.baseline(&path())));
+    }
+
+    #[test]
+    fn status_line_counts_lines_and_flags_cr_breaks() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"abc", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        assert_eq!(editor.status_text().0, "1 line");
+        editor.event(key(VK_RETURN, false, false), &mut ctx);
+        editor.notice = None;
+        assert_eq!(editor.status_text().0, "2 lines");
+        editor.pane.info.as_mut().unwrap().cr_breaks = true;
+        assert!(editor.status_text().0.contains("CR only"));
+    }
+
+    #[test]
+    fn read_only_file_save_is_refused_with_an_orange_dot() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"abc", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        let dot = |editor: &mut Editor| {
+            let mut pixels = vec![0u32; 800 * 600];
+            editor.paint(&mut pixels, 800, 600);
+            let title = editor.layout().title;
+            editor
+                .list
+                .glyphs
+                .iter()
+                .find(|g| title.contains(g.x, g.y) && g.ch == '\u{25CF}')
+                .map(|g| g.color)
+        };
+        *files.read_only.lock().unwrap() = true;
+        type_text(&mut editor, &mut ctx, "x");
+        assert_eq!(dot(&mut editor), Some(Theme::DARK.unsaved));
+        editor.event(key(VK_S, true, false), &mut ctx);
+        settle(&mut editor, &mut ctx);
+        assert_eq!(files.get(&path()).unwrap(), b"abc");
+        assert_eq!(files.names(), vec!["test.txt"]);
+        assert!(editor.pane.doc.is_dirty());
+        assert!(editor.notice.as_deref().unwrap().contains("is read-only"));
+        assert_eq!(dot(&mut editor), Some(Theme::DARK.warning));
+        // Editing goes on; after the attribute is cleared the save succeeds.
+        type_text(&mut editor, &mut ctx, "y");
+        *files.read_only.lock().unwrap() = false;
+        editor.event(key(VK_S, true, false), &mut ctx);
+        settle(&mut editor, &mut ctx);
+        assert_eq!(files.get(&path()).unwrap(), b"xyabc");
+        assert_eq!(dot(&mut editor), None);
+        // Quitting with changes asks again after a refused save.
+        *files.read_only.lock().unwrap() = true;
+        type_text(&mut editor, &mut ctx, "z");
+        editor.event(Event::CloseRequested, &mut ctx);
+        assert!(matches!(editor.pane.prompt, Some(Prompt::DirtyClose(_))));
+        editor.event(key(VK_S, false, false), &mut ctx);
+        settle(&mut editor, &mut ctx);
+        assert!(matches!(editor.pane.prompt, Some(Prompt::DirtyClose(_))));
+        assert!(editor.status_text().0.starts_with("test.txt is read-only."));
+        assert!(!ctx.close_requested());
+    }
+
+    #[test]
+    fn queued_save_uses_the_text_at_its_start_and_edits_stay_dirty() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"", false);
+        let (open, gate) = mpsc::channel();
+        *files.gate.lock().unwrap() = Some(gate);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        type_text(&mut editor, &mut ctx, "a");
+        editor.event(key(VK_S, true, false), &mut ctx);
+        type_text(&mut editor, &mut ctx, "b");
+        editor.event(key(VK_S, true, false), &mut ctx);
+        type_text(&mut editor, &mut ctx, "c");
+        editor.event(key(VK_S, true, false), &mut ctx);
+        assert!(editor.pane.save_queued.is_some());
+        open.send(()).unwrap();
+        // First save: "a"; the queued one starts with the current text.
+        for _ in 0..5000 {
+            if editor.pane.save_queued.is_none() && editor.pane.saving.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            editor.event(Event::Wake, &mut ctx);
+        }
+        assert!(
+            editor.pane.doc.is_dirty(),
+            "edits made during the save stay unsaved"
+        );
+        settle(&mut editor, &mut ctx);
+        assert_eq!(files.get(&path()).unwrap(), b"abc");
+        assert!(!editor.pane.doc.is_dirty());
+    }
+
+    #[test]
+    fn close_during_a_save_waits_and_then_closes() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"", false);
+        let (open, gate) = mpsc::channel();
+        *files.gate.lock().unwrap() = Some(gate);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        type_text(&mut editor, &mut ctx, "a");
+        editor.event(key(VK_S, true, false), &mut ctx);
+        editor.event(Event::CloseRequested, &mut ctx);
+        type_text(&mut editor, &mut ctx, "ignored");
+        assert_eq!(editor.status_text().0, "Saving\u{2026}");
+        assert!(!ctx.close_requested());
+        open.send(()).unwrap();
+        settle(&mut editor, &mut ctx);
+        assert!(ctx.close_requested());
+        assert_eq!(files.get(&path()).unwrap(), b"a");
+    }
+
+    #[test]
+    fn dirty_close_prompt() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        type_text(&mut editor, &mut ctx, "a");
+        editor.event(Event::CloseRequested, &mut ctx);
+        assert_eq!(editor.pane.prompt, Some(Prompt::DirtyClose(Exit::Quit)));
+        let prompt = editor.status_text().0;
+        assert!(prompt.contains("D: Discard"));
+        assert!(!prompt.contains("Don't Save"));
+        editor.event(key(VK_ESCAPE, false, false), &mut ctx);
+        assert_eq!(editor.pane.prompt, None);
+        assert!(!ctx.close_requested());
+        // Close asks too; after the save the file closes and the session stays.
+        editor.event(key(VK_W, true, false), &mut ctx);
+        assert_eq!(
+            editor.pane.prompt,
+            Some(Prompt::DirtyClose(Exit::CloseFile))
+        );
+        editor.event(key(VK_RETURN, false, false), &mut ctx);
+        settle(&mut editor, &mut ctx);
+        assert!(!ctx.close_requested());
+        assert!(editor.no_file());
+        assert_eq!(files.get(&path()).unwrap(), b"a");
+
+        let mut editor = editor_on(&files, b"", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        type_text(&mut editor, &mut ctx, "z");
+        editor.event(Event::CloseRequested, &mut ctx);
+        editor.event(key(VK_D, false, false), &mut ctx);
+        assert!(ctx.close_requested());
+        assert_eq!(files.get(&path()).unwrap(), b"");
+    }
+
+    #[test]
+    fn conflict_prompt_overwrites_only_on_request() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"old", false);
+        files.put(&path(), b"changed elsewhere");
+        let mut ctx = Ctx::headless(800, 600, 96);
+        type_text(&mut editor, &mut ctx, "x");
+        editor.event(key(VK_S, true, false), &mut ctx);
+        settle(&mut editor, &mut ctx);
+        assert!(matches!(editor.pane.prompt, Some(Prompt::Changed(_))));
+        assert_eq!(files.get(&path()).unwrap(), b"changed elsewhere");
+        // Only R and S answer.
+        editor.event(key(VK_ESCAPE, false, false), &mut ctx);
+        editor.event(key(VK_O, false, false), &mut ctx);
+        assert!(matches!(editor.pane.prompt, Some(Prompt::Changed(_))));
+        editor.event(key(VK_S, false, false), &mut ctx);
+        settle(&mut editor, &mut ctx);
+        assert_eq!(files.get(&path()).unwrap(), b"xold");
+        assert!(!editor.pane.doc.is_dirty());
+    }
+
+    /// A watcher that reports what the test sends.
+    fn fake_watcher(editor: &mut Editor) -> mpsc::Sender<crate::watcher::Report> {
+        let (tx, watcher) = Watcher::fake();
+        editor.pane.watching = Watching::Running(watcher);
+        tx
+    }
+
+    /// Sends the file's state at `path` as read in the watcher's current epoch.
+    fn report(editor: &mut Editor, ctx: &mut Ctx, tx: &mpsc::Sender<crate::watcher::Report>) {
+        let Watching::Running(watcher) = &editor.pane.watching else {
+            panic!("no watcher");
+        };
+        let stamp = editor
+            .files
+            .stamp(editor.pane.path.as_deref().unwrap())
+            .unwrap();
+        tx.send(crate::watcher::Report {
+            epoch: watcher.epoch(),
+            stamp,
+        })
+        .unwrap();
+        editor.event(Event::Wake, ctx);
+    }
+
+    #[test]
+    fn disk_change_prompts_reload_or_save_mine() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"mine", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        let tx = fake_watcher(&mut editor);
+        // The loaded version: nothing to ask.
+        report(&mut editor, &mut ctx, &tx);
+        assert_eq!(editor.pane.prompt, None);
+        files.put(&path(), b"theirs");
+        report(&mut editor, &mut ctx, &tx);
+        assert!(matches!(editor.pane.prompt, Some(Prompt::Changed(_))));
+        assert_eq!(
+            editor.status_text().0,
+            "test.txt changed on disk.   R: Reload   S: Save Current"
+        );
+        // Only R and S answer: not Escape, typing or Alt+F4.
+        editor.event(key(VK_ESCAPE, false, false), &mut ctx);
+        type_text(&mut editor, &mut ctx, "x");
+        let alt_f4 = Key {
+            vk: VK_F4,
+            ctrl: false,
+            shift: false,
+            alt: true,
+        };
+        editor.event(Event::Key(alt_f4), &mut ctx);
+        assert!(matches!(editor.pane.prompt, Some(Prompt::Changed(_))));
+        assert!(!ctx.close_requested());
+        assert_eq!(text(&editor), "mine");
+        editor.event(key(VK_S, false, false), &mut ctx);
+        settle(&mut editor, &mut ctx);
+        assert_eq!(files.get(&path()).unwrap(), b"mine");
+        assert_eq!(editor.pane.prompt, None);
+        // The own save is not an outside change.
+        report(&mut editor, &mut ctx, &tx);
+        assert_eq!(editor.pane.prompt, None);
+        // Deleted: one notice; back again: the prompt.
+        files.delete(&path()).unwrap();
+        report(&mut editor, &mut ctx, &tx);
+        assert_eq!(
+            editor.notice.as_deref(),
+            Some("test.txt was deleted on disk; saving recreates it")
+        );
+        editor.notice = None;
+        report(&mut editor, &mut ctx, &tx);
+        assert_eq!(editor.notice, None, "once");
+        files.put(&path(), b"back");
+        report(&mut editor, &mut ctx, &tx);
+        assert!(matches!(editor.pane.prompt, Some(Prompt::Changed(_))));
+        // Malformed UTF-16 cannot be saved: only R answers.
+        editor.pane.doc.locks.encoding = true;
+        assert!(
+            editor
+                .status_text()
+                .0
+                .ends_with("(cannot save: malformed UTF-16)")
+        );
+        editor.event(key(VK_S, false, false), &mut ctx);
+        assert!(matches!(editor.pane.prompt, Some(Prompt::Changed(_))));
+        assert!(editor.pane.saving.is_none());
+    }
+
+    #[test]
+    fn disk_change_reports_older_than_an_own_save_are_dropped() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        let tx = fake_watcher(&mut editor);
+        let (open, gate) = mpsc::channel();
+        *files.gate.lock().unwrap() = Some(gate);
+        type_text(&mut editor, &mut ctx, "a");
+        editor.event(key(VK_S, true, false), &mut ctx);
+        // Read while saving (the temporary file's change): waits for the save.
+        let stale = |stamp| crate::watcher::Report { epoch: 0, stamp };
+        tx.send(stale(Some(files.baseline(&path()).stamp))).unwrap();
+        tx.send(stale(None)).unwrap();
+        editor.event(Event::Wake, &mut ctx);
+        assert_eq!(editor.pane.prompt, None);
+        open.send(()).unwrap();
+        settle(&mut editor, &mut ctx);
+        assert_eq!(files.get(&path()).unwrap(), b"a");
+        // Delivered after the save finished: older than it, dropped.
+        tx.send(stale(None)).unwrap();
+        editor.event(Event::Wake, &mut ctx);
+        assert_eq!(
+            (editor.pane.prompt, editor.notice.as_deref()),
+            (None, Some("Saved"))
+        );
+        // Another program's write after the commit is reported.
+        files.put(&path(), b"theirs");
+        report(&mut editor, &mut ctx, &tx);
+        assert!(matches!(editor.pane.prompt, Some(Prompt::Changed(_))));
+    }
+
+    #[test]
+    fn disk_change_prompt_and_closing() {
+        let files = Arc::new(FakeFiles::default());
+        // A close request from Windows runs the quit flow.
+        let mut editor = editor_on(&files, b"mine", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        let tx = fake_watcher(&mut editor);
+        type_text(&mut editor, &mut ctx, "x");
+        files.put(&path(), b"theirs");
+        report(&mut editor, &mut ctx, &tx);
+        editor.event(Event::CloseRequested, &mut ctx);
+        assert_eq!(editor.pane.prompt, Some(Prompt::DirtyClose(Exit::Quit)));
+        // Saving at the close finds the change: S saves and quits.
+        editor.event(key(VK_RETURN, false, false), &mut ctx);
+        settle(&mut editor, &mut ctx);
+        assert!(matches!(editor.pane.prompt, Some(Prompt::Changed(_))));
+        editor.event(key(VK_S, false, false), &mut ctx);
+        settle(&mut editor, &mut ctx);
+        assert!(ctx.close_requested());
+        assert_eq!(files.get(&path()).unwrap(), b"xmine");
+
+        // R cancels the close (the file is gone, so nothing reloads).
+        let mut editor = editor_on(&files, b"mine", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        type_text(&mut editor, &mut ctx, "y");
+        files.put(&path(), b"theirs");
+        editor.event(key(VK_W, true, false), &mut ctx);
+        editor.event(key(VK_RETURN, false, false), &mut ctx);
+        settle(&mut editor, &mut ctx);
+        assert!(matches!(editor.pane.prompt, Some(Prompt::Changed(_))));
+        editor.event(key(VK_R, false, false), &mut ctx);
+        assert_eq!((editor.pane.prompt, editor.closing), (None, None));
+        settle_open(&mut editor, &mut ctx);
+        assert!(!editor.no_file(), "the close was cancelled");
+        assert!(!ctx.close_requested());
+    }
+
+    #[test]
+    fn reload_starts_fresh_and_keeps_the_place() {
+        let file = TempFile::new("reload.txt", b"abc\n");
+        let mut editor = empty_editor(false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        drop_file(&mut editor, &mut ctx, &file.0, 0);
+        settle_open(&mut editor, &mut ctx);
+        let tx = fake_watcher(&mut editor);
+        // Unsaved edits and history; the caret then before `c`.
+        editor.select_single(Selection::caret(4));
+        type_text(&mut editor, &mut ctx, "Z");
+        editor.select_single(Selection::caret(2));
+        assert!(editor.pane.doc.is_dirty());
+        // The new text has a two-byte character where the caret was.
+        std::fs::write(&file.0, "a\u{e9}\n").unwrap();
+        let Watching::Running(watcher) = &editor.pane.watching else {
+            panic!("no watcher");
+        };
+        let stamp = rtm_platform::files::stamp(&file.0).unwrap();
+        let epoch = watcher.epoch();
+        tx.send(crate::watcher::Report { epoch, stamp }).unwrap();
+        editor.event(Event::Wake, &mut ctx);
+        assert!(matches!(editor.pane.prompt, Some(Prompt::Changed(_))));
+        editor.event(key(VK_R, false, false), &mut ctx);
+        assert!(
+            editor
+                .notice
+                .as_deref()
+                .unwrap()
+                .starts_with("Reloading reload.txt")
+        );
+        settle_open(&mut editor, &mut ctx);
+        assert_eq!(text(&editor), "a\u{e9}\n");
+        assert!(!editor.pane.doc.is_dirty());
+        assert_eq!(editor.pane.doc.history.undo_len(), 0);
+        // The caret is on the character boundary before it.
+        assert_eq!(editor.pane.doc.selections.primary(), Selection::caret(1));
+        type_text(&mut editor, &mut ctx, "x");
+        assert_eq!(text(&editor), "ax\u{e9}\n");
+        assert!(
+            matches!(editor.pane.watching, Watching::Idle),
+            "a new watcher"
+        );
+    }
+
+    /// The disk version of `file` as the Changed prompt.
+    fn changed_prompt(editor: &mut Editor, file: &TempFile) {
+        let stamp = rtm_platform::files::stamp(&file.0).unwrap().unwrap();
+        editor.pane.prompt = Some(Prompt::Changed(Baseline { stamp, hash: None }));
+    }
+
+    #[test]
+    fn reload_keeps_the_text_read_only_until_it_is_replaced() {
+        let file = TempFile::new("pending.txt", b"mine\n");
+        let mut editor = empty_editor(false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        drop_file(&mut editor, &mut ctx, &file.0, 0);
+        settle_open(&mut editor, &mut ctx);
+        type_text(&mut editor, &mut ctx, "x");
+        std::fs::write(&file.0, b"theirs\n").unwrap();
+        changed_prompt(&mut editor, &file);
+        // The loader's answer applies only at the next wake-up: edits made
+        // before it are refused, not dropped with the old text.
+        ctx.set_clipboard("pasted", clip::FORMAT, &[]);
+        editor.event(key(VK_R, false, false), &mut ctx);
+        type_text(&mut editor, &mut ctx, "y");
+        editor.event(key(VK_V, true, false), &mut ctx);
+        editor.event(key(VK_Z, true, false), &mut ctx);
+        assert_eq!(text(&editor), "xmine\n");
+        settle_open(&mut editor, &mut ctx);
+        assert_eq!(text(&editor), "theirs\n");
+        assert_eq!(editor.pane.doc.history.undo_len(), 0);
+
+        // A reload that finds no file gives the editing back.
+        type_text(&mut editor, &mut ctx, "a");
+        changed_prompt(&mut editor, &file);
+        std::fs::remove_file(&file.0).unwrap();
+        editor.event(key(VK_R, false, false), &mut ctx);
+        settle_open(&mut editor, &mut ctx);
+        assert_eq!(editor.notice.as_deref(), Some("pending.txt was not found"));
+        // The caret came back after `x`: one byte into the text.
+        type_text(&mut editor, &mut ctx, "b");
+        assert_eq!(text(&editor), "tabheirs\n");
+
+        // Closing while a reload waits stops it; saving is not refused.
+        std::fs::write(&file.0, b"again\n").unwrap();
+        changed_prompt(&mut editor, &file);
+        editor.event(key(VK_R, false, false), &mut ctx);
+        editor.event(key(VK_W, true, false), &mut ctx);
+        assert!(editor.pane.pending.is_none());
+        assert_eq!(
+            editor.pane.prompt,
+            Some(Prompt::DirtyClose(Exit::CloseFile))
+        );
+        editor.event(key(VK_RETURN, false, false), &mut ctx);
+        settle(&mut editor, &mut ctx);
+        assert!(editor.no_file());
+    }
+
+    #[test]
+    fn typing_during_a_save_stays_a_separate_undo_step() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"", false);
+        let (open, gate) = mpsc::channel();
+        *files.gate.lock().unwrap() = Some(gate);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        type_text(&mut editor, &mut ctx, "a");
+        editor.event(key(VK_S, true, false), &mut ctx);
+        type_text(&mut editor, &mut ctx, "b");
+        open.send(()).unwrap();
+        settle(&mut editor, &mut ctx);
+        assert!(editor.pane.doc.is_dirty());
+        editor.event(key(VK_Z, true, false), &mut ctx);
+        assert_eq!(text(&editor), "a");
+        assert!(!editor.pane.doc.is_dirty(), "undo reaches the saved text");
+    }
+
+    /// An editor started without a file.
+    fn empty_editor(read_only: bool) -> Editor {
+        Editor::new(
+            None,
+            None,
+            None,
+            renderer(),
+            96,
+            settings(read_only, false),
+            Trace::new(false),
+            Arc::new(FakeFiles::default()),
+            Arc::new(|| {}),
+        )
+    }
+
+    /// A real file for drops (the loader reads the disk), removed on drop.
+    struct TempFile(PathBuf);
+
+    impl TempFile {
+        fn new(name: &str, text: &[u8]) -> TempFile {
+            // Unique per call: tests run in parallel and reuse names.
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let dir = std::env::temp_dir().join(format!(
+                "rtm_drop_{}_{n}_{}",
+                std::process::id(),
+                name.replace('.', "_")
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(name);
+            std::fs::write(&path, text).unwrap();
+            TempFile(path)
+        }
+    }
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            if let Some(dir) = self.0.parent() {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+
+    fn drop_file(editor: &mut Editor, ctx: &mut Ctx, path: &Path, others: u32) {
+        let dropped = Dropped {
+            path: path.to_path_buf(),
+            second: None,
+            others,
+            point: None,
+        };
+        editor.event(Event::FilesDropped(Ok(dropped)), ctx);
+    }
+
+    /// Wakes the editor until no dropped file is pending and none is loading.
+    fn settle_open(editor: &mut Editor, ctx: &mut Ctx) {
+        pump(editor, ctx, |e| {
+            e.pane.pending.is_none() && !matches!(e.pane.status, LoadStatus::Loading { .. })
+        });
+    }
+
+    #[test]
+    fn dropping_a_file_opens_it_in_the_empty_state() {
+        let file = TempFile::new("dropped.txt", b"hello");
+        let mut editor = empty_editor(false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        drop_file(&mut editor, &mut ctx, &file.0, 0);
+        assert!(
+            editor
+                .notice
+                .as_deref()
+                .unwrap()
+                .starts_with("Opening dropped.txt")
+        );
+        settle_open(&mut editor, &mut ctx);
+        assert_eq!(editor.pane.path.as_deref(), Some(file.0.as_path()));
+        assert_eq!(text(&editor), "hello");
+        assert!(!editor.pane.doc.locks.no_file);
+        assert_eq!(
+            ctx.requested_title(),
+            Some(window_title(Some(&file.0), None, false).as_str())
+        );
+        type_text(&mut editor, &mut ctx, "x");
+        assert_eq!(text(&editor), "xhello", "editable");
+    }
+
+    #[test]
+    fn a_dropped_file_replaces_a_clean_file_and_resets_its_state() {
+        let file = TempFile::new("next.py", b"def f():\n    pass\n");
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"cat cat cat\n", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        // History, cursor history, a toggled lock and a search with a scope.
+        type_text(&mut editor, &mut ctx, "x");
+        editor.event(key(VK_Z, true, false), &mut ctx);
+        editor.event(key(VK_D, true, false), &mut ctx);
+        editor.event(key(VK_F, true, false), &mut ctx);
+        type_text(&mut editor, &mut ctx, "cat");
+        editor.pane.find.as_mut().unwrap().scope = Some(0..3);
+        editor.event(key(VK_ESCAPE, false, false), &mut ctx);
+        assert!(!editor.pane.doc.is_dirty());
+        drop_file(&mut editor, &mut ctx, &file.0, 2);
+        settle_open(&mut editor, &mut ctx);
+        assert_eq!(text(&editor), "def f():\n    pass\n");
+        assert_eq!(editor.pane.doc.history.undo_len(), 0);
+        assert_eq!(editor.pane.doc.history.redo_len(), 0);
+        assert!(editor.pane.cursor_history.is_empty());
+        let f = editor.pane.find.as_ref().unwrap();
+        assert!(!f.open && f.scope.is_none());
+        assert!(f.find.as_str().starts_with("cat"), "the query stays");
+        assert_eq!(editor.pane.language.map(|l| l.id), Some("python"));
+        assert!(editor.pane.syntax.is_some());
+        assert_eq!(
+            editor.notice.as_deref(),
+            Some("Two files open at a time; 2 more ignored")
+        );
+    }
+
+    #[test]
+    fn drops_onto_unsaved_changes_or_a_running_save_are_refused() {
+        let file = TempFile::new("other.txt", b"other");
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"mine", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        type_text(&mut editor, &mut ctx, "x");
+        drop_file(&mut editor, &mut ctx, &file.0, 0);
+        assert!(editor.pane.pending.is_none());
+        assert_eq!(
+            editor.notice.as_deref(),
+            Some("test.txt has unsaved changes; save or close it to open other.txt")
+        );
+        assert_eq!(text(&editor), "xmine");
+        // During a save.
+        let (open, gate) = mpsc::channel();
+        *files.gate.lock().unwrap() = Some(gate);
+        editor.event(key(VK_S, true, false), &mut ctx);
+        drop_file(&mut editor, &mut ctx, &file.0, 0);
+        assert!(editor.notice.as_deref().unwrap().contains("is being saved"));
+        open.send(()).unwrap();
+        settle(&mut editor, &mut ctx);
+        assert_eq!(text(&editor), "xmine");
+        // Edited while the dropped file loads: the file stays.
+        drop_file(&mut editor, &mut ctx, &file.0, 0);
+        assert!(editor.pane.pending.is_some());
+        type_text(&mut editor, &mut ctx, "y");
+        settle_open(&mut editor, &mut ctx);
+        assert_eq!(text(&editor), "xymine");
+        assert!(
+            editor
+                .notice
+                .as_deref()
+                .unwrap()
+                .contains("unsaved changes")
+        );
+    }
+
+    #[test]
+    fn folders_failed_drops_and_prompts_leave_the_file_as_it_is() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, &b"line\n".repeat(200), false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(key(VK_DOWN, true, false), &mut ctx);
+        editor.event(key(VK_END, true, false), &mut ctx);
+        let (scroll, sels) = (editor.scroll, editor.pane.doc.selections.clone());
+        drop_file(&mut editor, &mut ctx, &std::env::temp_dir(), 0);
+        settle_open(&mut editor, &mut ctx);
+        assert_eq!(editor.notice.as_deref(), Some("Folders cannot be opened"));
+        assert_eq!(editor.pane.path, Some(path()));
+        assert_eq!(
+            (editor.scroll, &editor.pane.doc.selections),
+            (scroll, &sels)
+        );
+        // A drop the platform could not read: one notice, nothing else.
+        let error = "The dropped file name could not be read".to_owned();
+        editor.event(Event::FilesDropped(Err(error.clone())), &mut ctx);
+        assert_eq!(editor.notice.as_deref(), Some(error.as_str()));
+        assert!(editor.pane.pending.is_none());
+        // While a question is shown, drops are ignored.
+        type_text(&mut editor, &mut ctx, "x");
+        editor.event(key(VK_W, true, false), &mut ctx);
+        let file = TempFile::new("ignored.txt", b"");
+        drop_file(&mut editor, &mut ctx, &file.0, 0);
+        assert!(editor.pane.pending.is_none());
+        assert!(editor.pane.prompt.is_some());
+    }
+
+    #[test]
+    fn closing_returns_to_the_empty_state() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"abc", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(key(VK_W, true, false), &mut ctx);
+        assert!(editor.no_file() && !ctx.close_requested());
+        assert_eq!(ctx.requested_title(), Some(APP_NAME));
+
+        let mut editor = editor_on(&files, b"abc", false);
+        type_text(&mut editor, &mut ctx, "x");
+        editor.event(key(VK_F4, true, false), &mut ctx);
+        assert_eq!(
+            editor.pane.prompt,
+            Some(Prompt::DirtyClose(Exit::CloseFile))
+        );
+        editor.event(key(VK_ESCAPE, false, false), &mut ctx);
+        assert!(!editor.no_file());
+        editor.event(key(VK_W, true, false), &mut ctx);
+        editor.event(key(VK_D, false, false), &mut ctx);
+        assert!(editor.no_file() && !ctx.close_requested());
+        assert_eq!(
+            files.get(&path()).unwrap(),
+            b"abc",
+            "Don't Save keeps the file"
+        );
+        // Quit from the empty state.
+        let alt_f4 = Event::Key(Key {
+            vk: VK_F4,
+            ctrl: false,
+            shift: false,
+            alt: true,
+        });
+        editor.event(alt_f4, &mut ctx);
+        assert!(ctx.close_requested());
+    }
+
+    #[test]
+    fn read_only_and_the_syntax_choice_follow_their_files() {
+        let file = TempFile::new("next.py", b"x = 1\n");
+        let files = Arc::new(FakeFiles::default());
+        files.put(&path(), b"{}");
+        let (tx, rx) = mpsc::channel();
+        tx.send(done(b"{}")).unwrap();
+        drop(tx);
+        let mut settings = settings(true, false);
+        settings.syntax = Some("json".to_owned());
+        let mut editor = Editor::new(
+            Some(&path()),
+            None,
+            Some(Load::new(rx)),
+            renderer(),
+            96,
+            settings,
+            Trace::new(false),
+            files,
+            Arc::new(|| {}),
+        );
+        let mut ctx = Ctx::headless(800, 600, 96);
+        assert_eq!(editor.pane.language.map(|l| l.id), Some("json"));
+        // Toggled off for this file; the next one is read-only again.
+        editor.perform(Action::ToggleReadOnly, &mut ctx);
+        assert!(!editor.pane.doc.locks.user);
+        drop_file(&mut editor, &mut ctx, &file.0, 0);
+        settle_open(&mut editor, &mut ctx);
+        assert!(editor.pane.doc.locks.user);
+        assert_eq!(editor.pane.language.map(|l| l.id), Some("python"));
+    }
+
+    #[test]
+    fn a_syntax_choice_without_a_file_starts_no_syntax_work() {
+        let file = TempFile::new("next.py", b"x = 1\n");
+        let mut settings = settings(false, false);
+        settings.syntax = Some("json".to_owned());
+        let mut editor = Editor::new(
+            None,
+            None,
+            None,
+            renderer(),
+            96,
+            settings,
+            Trace::new(false),
+            Arc::new(FakeFiles::default()),
+            Arc::new(|| {}),
+        );
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Shown, &mut ctx);
+        assert!(
+            editor.pane.language.is_none(),
+            "--syntax waits for a command-line file"
+        );
+        for _ in 0..2 {
+            editor.perform(Action::ToggleSyntax, &mut ctx);
+            assert!(editor.no_file() && editor.pane.syntax.is_none());
+        }
+        assert!(editor.highlighting, "the toggle stays a preference");
+        drop_file(&mut editor, &mut ctx, &file.0, 0);
+        settle_open(&mut editor, &mut ctx);
+        assert_eq!(editor.pane.language.map(|l| l.id), Some("python"));
+        assert!(editor.pane.syntax.is_some());
+    }
+
+    #[test]
+    fn a_new_file_searches_after_a_busy_search_of_the_old_one() {
+        let file = TempFile::new("b.txt", b"cat dog cat");
+        let files = Arc::new(FakeFiles::default());
+        let text_a = "cat ".repeat(50_000);
+        let mut editor = editor_on(&files, text_a.as_bytes(), false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(key(VK_F, true, false), &mut ctx);
+        // Many case-insensitive queries: generations climb on the search thread.
+        for _ in 0..30 {
+            type_text(&mut editor, &mut ctx, "c");
+            editor.event(key(VK_BACK, false, false), &mut ctx);
+        }
+        type_text(&mut editor, &mut ctx, "cat");
+        let old = editor.pane.find.as_ref().unwrap().generation;
+        drop_file(&mut editor, &mut ctx, &file.0, 0);
+        settle_open(&mut editor, &mut ctx);
+        assert!(editor.pane.find.as_ref().unwrap().generation > old);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !editor.pane.search.as_ref().unwrap().holds_checkpoints(),
+            "the old text is released"
+        );
+        editor.event(key(VK_F, true, false), &mut ctx);
+        pump(&mut editor, &mut ctx, |e| counter(e).ends_with("of 2"));
+        assert_eq!(text(&editor), "cat dog cat");
+    }
+
+    #[test]
+    fn only_visible_changes_request_a_repaint() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"abc", false);
+        let unchanged = [
+            key(0x7B, false, false), // F12: not bound
+            Event::Char('\u{1}'),
+            key(VK_LEFT, false, false), // already at the start
+            Event::Wheel {
+                delta: 10,
+                horizontal: false,
+                shift: false,
+                ctrl: false,
+            },
+        ];
+        for event in unchanged {
+            let mut ctx = Ctx::headless(800, 600, 96);
+            editor.event(event.clone(), &mut ctx);
+            assert!(!ctx.redraw_requested(), "{event:?}");
+        }
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Char('x'), &mut ctx);
+        assert!(ctx.redraw_requested());
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(key(VK_OEM_PLUS, true, false), &mut ctx);
+        assert!(ctx.redraw_requested(), "zoom changes the cell size");
+    }
+
+    #[test]
+    fn mouse_selects_characters_words_and_lines() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"alpha beta\ngamma", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.size = ctx.size();
+        let layout = editor.layout();
+        let cell = editor.renderer.cell();
+        let at = |col: i32, row: i32| {
+            (
+                layout.text.x + col * cell.width as i32,
+                layout.text.y + row * cell.height as i32 + 2,
+            )
+        };
+        let down = |(x, y): (i32, i32), clicks, shift| Event::MouseDown {
+            x,
+            y,
+            clicks,
+            shift,
+            ctrl: false,
+            alt: false,
+            middle: false,
+        };
+        editor.event(down(at(7, 0), 2, false), &mut ctx);
+        assert_eq!(editor.pane.doc.selections.primary(), Selection::new(6, 10));
+        let (x, y) = at(2, 1);
+        editor.event(Event::MouseMove { x, y }, &mut ctx);
+        assert_eq!(editor.pane.doc.selections.primary(), Selection::new(6, 16));
+        editor.event(Event::MouseUp, &mut ctx);
+        editor.event(down(at(1, 0), 3, false), &mut ctx);
+        assert_eq!(editor.pane.doc.selections.primary(), Selection::new(0, 11));
+        editor.event(Event::MouseUp, &mut ctx);
+        editor.event(down(at(3, 0), 1, false), &mut ctx);
+        editor.event(down(at(1, 1), 1, true), &mut ctx);
+        assert_eq!(editor.pane.doc.selections.primary(), Selection::new(3, 12));
+        assert!(editor.is_text(at(1, 1).0, at(1, 1).1));
+    }
+
+    fn click(x: i32, y: i32) -> Event {
+        Event::MouseDown {
+            x,
+            y,
+            clicks: 1,
+            shift: false,
+            ctrl: false,
+            alt: false,
+            middle: false,
+        }
+    }
+
+    fn palette(editor: &Editor) -> &Palette {
+        match &editor.popup {
+            Some(Popup::Palette(p)) => p,
+            _ => panic!("the palette is not open"),
+        }
+    }
+
+    fn panel(editor: &Editor) -> &Panel {
+        match &editor.popup {
+            Some(Popup::Panel(panel)) => panel,
+            _ => panic!("no panel is open"),
+        }
+    }
+
+    fn palette_labels(editor: &Editor) -> Vec<&str> {
+        let p = palette(editor);
+        p.items
+            .iter()
+            .map(|item| match item {
+                Item::Header(h) => h,
+                Item::Separator => "---",
+                Item::Command { index, .. } => COMMANDS[*index].label,
+                Item::Choice { index, .. } => p.choices.labels[*index].as_str(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn palette_runs_commands_and_ctrl_p_lists_recent_and_favorites() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"one two", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(key(VK_P, true, true), &mut ctx);
+        assert!(ctx.redraw_requested());
+        type_text(&mut editor, &mut ctx, "selection select all");
+        assert_eq!(palette_labels(&editor)[0], "Selection: Select All");
+        editor.event(key(VK_RETURN, false, false), &mut ctx);
+        assert!(editor.popup.is_none());
+        assert_eq!(editor.pane.doc.selections.primary(), Selection::new(0, 7));
+        assert_eq!(text(&editor), "one two", "typing went to the palette");
+
+        // Ctrl+Space stars the selected command; its space character is dropped.
+        editor.event(key(VK_F1, false, false), &mut ctx);
+        type_text(&mut editor, &mut ctx, "undo");
+        editor.event(key(VK_SPACE, true, false), &mut ctx);
+        editor.event(Event::Char(' '), &mut ctx);
+        assert_eq!(palette(&editor).query.as_str(), "undo");
+        editor.event(key(VK_BACK, false, false), &mut ctx);
+        assert_eq!(palette(&editor).query.as_str(), "und");
+        editor.event(key(VK_ESCAPE, false, false), &mut ctx);
+        assert!(editor.popup.is_none());
+
+        editor.event(key(VK_P, true, false), &mut ctx);
+        assert_eq!(
+            palette_labels(&editor),
+            vec![
+                "recently used",
+                "Selection: Select All",
+                "favorites",
+                "Edit: Undo"
+            ]
+        );
+        // Unstarring in the favorites view removes the row and keeps a selection.
+        editor.event(key(VK_DOWN, false, false), &mut ctx);
+        editor.event(key(VK_SPACE, true, false), &mut ctx);
+        assert_eq!(
+            palette_labels(&editor),
+            vec!["recently used", "Selection: Select All"]
+        );
+        assert_eq!(palette(&editor).selected, Some(1));
+    }
+
+    #[test]
+    fn palette_mouse_stars_runs_and_closes() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"abc", true);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(key(VK_P, true, true), &mut ctx);
+        type_text(&mut editor, &mut ctx, "cut");
+        let p = palette(&editor);
+        let cut = p.selected_command().unwrap();
+        assert_eq!(cut.id, "editor.action.clipboardCutAction");
+        assert!(
+            !enabled(cut, editor.pane.doc.locks, true, [true; 2]),
+            "read-only disables mutating commands"
+        );
+        let g = editor.palette_geometry(p);
+        let star = g.star_area(0, editor.ui_cell());
+        assert!(!editor.is_text(star.x + 2, star.y + 2));
+        editor.event(click(star.x + 2, star.y + 2), &mut ctx);
+        let cut_index = commands::index_of(cut.id).unwrap();
+        assert!(editor.store.as_ref().unwrap().is_favorite(cut_index));
+        assert!(editor.popup.is_some(), "the star keeps the palette open");
+        editor.event(click(g.list.x + 200, g.list.y + 2), &mut ctx);
+        assert!(editor.popup.is_none());
+        assert_eq!(editor.notice.as_deref(), Some("Not editable: read-only"));
+        assert_eq!(text(&editor), "abc");
+
+        editor.event(key(VK_P, true, false), &mut ctx);
+        assert_eq!(palette_labels(&editor), vec!["recently used", "Edit: Cut"]);
+        editor.event(click(1, 590), &mut ctx);
+        assert!(editor.popup.is_none(), "a click outside closes the palette");
+
+        // Toggle Read-Only from the palette makes the document editable.
+        editor.event(key(VK_P, true, true), &mut ctx);
+        type_text(&mut editor, &mut ctx, "toggle read");
+        editor.event(key(VK_RETURN, false, false), &mut ctx);
+        type_text(&mut editor, &mut ctx, "x");
+        assert_eq!(text(&editor), "xabc");
+    }
+
+    /// An editor on `text` loaded from `name` (detection uses the name).
+    fn editor_named(name: &str, text: &[u8]) -> Editor {
+        let (tx, rx) = mpsc::channel();
+        tx.send(done(text)).unwrap();
+        drop(tx);
+        Editor::new(
+            Some(Path::new(name)),
+            None,
+            Some(Load::new(rx)),
+            renderer(),
+            96,
+            settings(false, false),
+            Trace::new(false),
+            Arc::new(FakeFiles::default()),
+            Arc::new(|| {}),
+        )
+    }
+
+    /// The loader hook starts a syntax thread only for a code file within
+    /// `syntax.maxFileMiB`.
+    #[test]
+    fn the_loader_hook_starts_syntax_for_code_within_the_limit() {
+        let snapshot = Snapshot::from_bytes(b"fn main() {}\n");
+        let run = |path: &str, max_mib: u64| {
+            let slot: EarlySyntax = Default::default();
+            let hook = crate::syntax::early_start(
+                slot.clone(),
+                PathBuf::from(path),
+                None,
+                max_mib,
+                true,
+                Arc::new(|| {}),
+            );
+            hook(&snapshot);
+            slot.lock().unwrap().syntax.as_ref().map(|(l, _)| l.id)
+        };
+        assert_eq!(run(r"C:\a.rs", 32), Some("rust"));
+        assert_eq!(run(r"C:\a.txt", 32), None);
+        assert_eq!(run(r"C:\a.rs", 0), None);
+    }
+
+    /// The editor takes over a syntax thread started by the loader for the
+    /// same language and text, and starts its own otherwise.
+    #[test]
+    fn an_early_syntax_thread_is_adopted_when_it_matches() {
+        let snapshot = Snapshot::from_bytes(b"fn main() {}\n");
+        for (lang, adopted) in [("rust", true), ("python", false)] {
+            let lang = rtm_syntax::by_id(lang).unwrap();
+            let early = Syntax::start(lang, snapshot.clone(), true, Arc::new(|| {}));
+            let id = early.id();
+            let slot: EarlySyntax = Arc::new(std::sync::Mutex::new(crate::syntax::Early {
+                syntax: Some((lang, early)),
+                closed: false,
+            }));
+            let (tx, rx) = mpsc::channel();
+            tx.send(LoadEvent::Done {
+                snapshot: snapshot.clone(),
+                info: info(),
+                baseline: None,
+                read_ms: 0.0,
+            })
+            .unwrap();
+            drop(tx);
+            let mut settings = settings(false, false);
+            settings.early_syntax = Some(slot.clone());
+            let editor = Editor::new(
+                Some(Path::new(r"C:\src\main.rs")),
+                None,
+                Some(Load::new(rx)),
+                renderer(),
+                96,
+                settings,
+                Trace::new(false),
+                Arc::new(FakeFiles::default()),
+                Arc::new(|| {}),
+            );
+            assert!(slot.lock().unwrap().syntax.is_none(), "taken once");
+            let syntax = editor.pane.syntax.as_ref().unwrap();
+            assert!(syntax.is_for(&editor.pane.doc.snapshot));
+            assert_eq!(syntax.id() == id, adopted, "{}", lang.id);
+        }
+    }
+
+    /// Turning highlighting off or choosing Plain Text while loading stops
+    /// the loader's syntax thread, whether it started before or after.
+    #[test]
+    fn an_early_syntax_thread_does_not_outlive_highlighting_off() {
+        let text = b"fn main() {}\n";
+        for (plain, hook_first) in [(false, false), (false, true), (true, false), (true, true)] {
+            let slot: EarlySyntax = Default::default();
+            let mut hook = Some(crate::syntax::early_start(
+                slot.clone(),
+                PathBuf::from(r"C:\src\main.rs"),
+                None,
+                32,
+                true,
+                Arc::new(|| {}),
+            ));
+            let (tx, rx) = mpsc::channel();
+            tx.send(LoadEvent::Progress {
+                snapshot: Snapshot::from_bytes(b"fn"),
+                loaded: 2,
+                total: text.len() as u64,
+            })
+            .unwrap();
+            let first = rx.recv().ok();
+            let mut settings = settings(false, false);
+            settings.early_syntax = Some(slot.clone());
+            let mut editor = Editor::new(
+                Some(Path::new(r"C:\src\main.rs")),
+                first,
+                Some(Load::new(rx)),
+                renderer(),
+                96,
+                settings,
+                Trace::new(false),
+                Arc::new(FakeFiles::default()),
+                Arc::new(|| {}),
+            );
+            let mut ctx = Ctx::headless(800, 600, 96);
+            let case = format!("plain {plain}, hook first {hook_first}");
+            if hook_first {
+                hook.take().unwrap()(&Snapshot::from_bytes(text));
+                assert!(slot.lock().unwrap().syntax.is_some(), "{case}");
+            }
+            if plain {
+                editor.set_language(0);
+            } else {
+                editor.perform(Action::ToggleSyntax, &mut ctx);
+            }
+            if let Some(hook) = hook {
+                hook(&Snapshot::from_bytes(text));
+            }
+            assert!(slot.lock().unwrap().syntax.is_none(), "{case}");
+            tx.send(done(text)).unwrap();
+            editor.event(Event::Wake, &mut ctx);
+            assert!(matches!(editor.pane.status, LoadStatus::Ready), "{case}");
+            assert!(editor.pane.syntax.is_none(), "{case}");
+        }
+    }
+
+    /// Delivers wake-ups until the syntax thread posted trees for the text.
+    fn wait_for_syntax(editor: &mut Editor, ctx: &mut Ctx) {
+        for _ in 0..5000 {
+            editor.event(Event::Wake, ctx);
+            if editor.pane.syntax.as_ref().is_some_and(Syntax::settled) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("no syntax trees");
+    }
+
+    /// Color of the first drawn text glyph `ch`.
+    fn glyph_color(editor: &mut Editor, ch: char) -> u32 {
+        let mut pixels = vec![0u32; 800 * 600];
+        editor.paint(&mut pixels, 800, 600);
+        let clip = editor.layout().text;
+        editor
+            .list
+            .glyphs
+            .iter()
+            .find(|g| g.clip == clip && g.ch == ch)
+            .map(|g| g.color)
+            .unwrap()
+    }
+
+    #[test]
+    fn code_is_highlighted_by_the_syntax_thread() {
+        let mut ctx = Ctx::headless(800, 600, 96);
+        let mut editor = editor_named(r"C:\src\main.rs", b"fn main() {}\n");
+        editor.event(
+            Event::Resized {
+                width: 800,
+                height: 600,
+            },
+            &mut ctx,
+        );
+        assert_eq!(editor.pane.language.map(|l| l.id), Some("rust"));
+        assert!(editor.status_text().1.contains("Rust"));
+        wait_for_syntax(&mut editor, &mut ctx);
+        let keyword = editor.theme.syntax[rtm_syntax::Style::Keyword as usize];
+        assert_eq!(glyph_color(&mut editor, 'f'), keyword);
+        // Edits move the highlights with the text, then undo restores them.
+        editor.event(key(VK_HOME, true, false), &mut ctx);
+        type_text(&mut editor, &mut ctx, "// c");
+        editor.event(key(VK_RETURN, false, false), &mut ctx);
+        let comment = editor.theme.syntax[rtm_syntax::Style::Comment as usize];
+        wait_for_syntax(&mut editor, &mut ctx);
+        assert_eq!(glyph_color(&mut editor, 'c'), comment);
+        assert_eq!(glyph_color(&mut editor, 'f'), keyword);
+        while text(&editor) != "fn main() {}\n" {
+            editor.event(key(VK_Z, true, false), &mut ctx);
+        }
+        wait_for_syntax(&mut editor, &mut ctx);
+        assert_eq!(glyph_color(&mut editor, 'f'), keyword);
+        // Turning highlighting off stops the thread and draws plain text.
+        editor.perform(Action::ToggleSyntax, &mut ctx);
+        assert!(editor.pane.syntax.is_none() && editor.pane.doc.journal.is_none());
+        assert_eq!(glyph_color(&mut editor, 'f'), editor.theme.text);
+        editor.perform(Action::ToggleSyntax, &mut ctx);
+        wait_for_syntax(&mut editor, &mut ctx);
+        assert_eq!(glyph_color(&mut editor, 'f'), keyword);
+    }
+
+    #[test]
+    fn windows_batch_files_highlight_and_can_be_selected_manually() {
+        for name in [r"C:\scripts\build.bat", r"C:\scripts\setup.cmd"] {
+            let mut ctx = Ctx::headless(800, 600, 96);
+            let mut editor = editor_named(name, b"@echo off\r\nREM build\r\n");
+            editor.event(
+                Event::Resized {
+                    width: 800,
+                    height: 600,
+                },
+                &mut ctx,
+            );
+            assert_eq!(editor.pane.language.map(|l| l.id), Some("batch"));
+            assert!(editor.status_text().1.contains("Batch"));
+            wait_for_syntax(&mut editor, &mut ctx);
+            let keyword = editor.theme.syntax[rtm_syntax::Style::Keyword as usize];
+            assert_eq!(glyph_color(&mut editor, '@'), keyword);
+            editor.event(key(VK_OEM_2, true, false), &mut ctx);
+            assert!(text(&editor).starts_with("REM @echo off\r\n"));
+            wait_for_syntax(&mut editor, &mut ctx);
+            let comment = editor.theme.syntax[rtm_syntax::Style::Comment as usize];
+            assert_eq!(glyph_color(&mut editor, 'R'), comment);
+            editor.event(key(VK_Z, true, false), &mut ctx);
+            wait_for_syntax(&mut editor, &mut ctx);
+            assert_eq!(glyph_color(&mut editor, '@'), keyword);
+        }
+        let mut ctx = Ctx::headless(800, 600, 96);
+        let mut editor = editor_named(r"C:\scripts\notes.txt", b"@echo off\r\n");
+        chord_k(&mut editor, &mut ctx, VK_M);
+        assert!(
+            palette(&editor)
+                .choices
+                .labels
+                .iter()
+                .any(|label| label == "Batch")
+        );
+        type_text(&mut editor, &mut ctx, "batch");
+        editor.event(key(VK_RETURN, false, false), &mut ctx);
+        assert_eq!(editor.pane.language.map(|l| l.id), Some("batch"));
+        assert!(editor.pane.syntax.is_some());
+    }
+
+    #[test]
+    fn plain_text_runs_no_syntax_work() {
+        let files = Arc::new(FakeFiles::default());
+        let editor = editor_on(&files, b"fn main() {}\n", false);
+        assert!(editor.pane.language.is_none());
+        assert!(editor.pane.syntax.is_none() && editor.pane.doc.journal.is_none());
+        let mut ctx = Ctx::headless(800, 600, 96);
+        let mut editor = editor_named(r"C:\big.json", &vec![b' '; 33 * 1024 * 1024]);
+        editor.event(Event::Wake, &mut ctx);
+        assert!(editor.pane.syntax.is_none());
+        assert!(editor.status_text().0.contains("larger than 32 MiB"));
+    }
+
+    fn chord_k(editor: &mut Editor, ctx: &mut Ctx, second: u16) {
+        editor.event(key(VK_K, true, false), ctx);
+        editor.event(key(second, false, false), ctx);
+    }
+
+    fn alt_shift(vk: u16) -> Event {
+        Event::Key(Key {
+            vk,
+            ctrl: false,
+            shift: true,
+            alt: true,
+        })
+    }
+
+    fn caret(editor: &Editor) -> u64 {
+        editor.pane.doc.selections.primary().head
+    }
+
+    #[test]
+    fn change_language_mode_and_code_commands() {
+        let mut ctx = Ctx::headless(800, 600, 96);
+        let mut editor = editor_named(r"C:\notes.txt", b"");
+        assert!(editor.pane.language.is_none());
+        chord_k(&mut editor, &mut ctx, VK_M);
+        assert_eq!(palette(&editor).mode, Mode::Language);
+        assert_eq!(
+            palette(&editor)
+                .selected
+                .and_then(|i| palette(&editor).choice_at(i)),
+            Some(0),
+            "Plain Text is current"
+        );
+        type_text(&mut editor, &mut ctx, "rust");
+        editor.event(key(VK_RETURN, false, false), &mut ctx);
+        assert!(editor.popup.is_none());
+        assert_eq!(editor.pane.language.map(|l| l.id), Some("rust"));
+        assert!(editor.pane.syntax.is_some());
+
+        // Auto-closing pairs, Enter between braces, Backspace in a pair.
+        type_text(&mut editor, &mut ctx, "fn f(");
+        assert_eq!(text(&editor), "fn f()");
+        type_text(&mut editor, &mut ctx, ") {");
+        assert_eq!(text(&editor), "fn f() {}");
+        editor.event(key(VK_RETURN, false, false), &mut ctx);
+        assert_eq!(text(&editor), "fn f() {\n    \n}");
+        type_text(&mut editor, &mut ctx, "g(");
+        editor.event(key(VK_BACK, false, false), &mut ctx);
+        assert_eq!(text(&editor), "fn f() {\n    g\n}");
+        type_text(&mut editor, &mut ctx, "();");
+
+        // Toggle Line Comment and back.
+        editor.event(key(VK_OEM_2, true, false), &mut ctx);
+        assert_eq!(text(&editor), "fn f() {\n    // g();\n}");
+        editor.event(key(VK_OEM_2, true, false), &mut ctx);
+        assert_eq!(text(&editor), "fn f() {\n    g();\n}");
+
+        // Go to Bracket from the opening brace and back.
+        wait_for_syntax(&mut editor, &mut ctx);
+        editor.select_single(Selection::caret(7));
+        editor.event(key(VK_OEM_5, true, true), &mut ctx);
+        assert_eq!(caret(&editor), text(&editor).rfind('}').unwrap() as u64);
+        editor.event(key(VK_OEM_5, true, true), &mut ctx);
+        assert_eq!(caret(&editor), 7);
+
+        // Expand Selection grows through the syntax tree; Shrink returns.
+        let g = text(&editor).find('g').unwrap() as u64;
+        editor.select_single(Selection::caret(g));
+        editor.event(alt_shift(VK_RIGHT), &mut ctx);
+        assert_eq!(editor.pane.doc.selections.primary().range(), g..g + 1);
+        editor.event(alt_shift(VK_RIGHT), &mut ctx);
+        editor.event(alt_shift(VK_RIGHT), &mut ctx);
+        assert!(editor.pane.doc.selections.primary().range().end - g >= 3);
+        editor.event(alt_shift(VK_LEFT), &mut ctx);
+        editor.event(alt_shift(VK_LEFT), &mut ctx);
+        assert_eq!(editor.pane.doc.selections.primary().range(), g..g + 1);
+
+        // Go to Symbol lists `f` (from the syntax thread) and moves the
+        // caret to it.
+        editor.select_single(Selection::caret(text(&editor).len() as u64));
+        editor.event(key(VK_O, true, true), &mut ctx);
+        assert_eq!(palette(&editor).mode, Mode::Symbol);
+        for _ in 0..5000 {
+            if !editor.pane.symbols_pending {
+                break;
+            }
+            editor.event(Event::Wake, &mut ctx);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(palette(&editor).choices.labels, ["f"]);
+        editor.event(key(VK_RETURN, false, false), &mut ctx);
+        assert_eq!(caret(&editor), 3);
+        // Unchanged text: the list shows at once.
+        editor.event(key(VK_O, true, true), &mut ctx);
+        assert!(!editor.pane.symbols_pending);
+        assert_eq!(palette(&editor).choices.labels, ["f"]);
+        editor.event(key(VK_ESCAPE, false, false), &mut ctx);
+
+        // The bracket pair at the caret is drawn.
+        editor.select_single(Selection::caret(7));
+        assert_eq!(editor.bracket_pair().map(|(a, _)| a), Some(7));
+    }
+
+    #[test]
+    fn code_commands_follow_the_embedded_language() {
+        let mut ctx = Ctx::headless(800, 600, 96);
+        let html = "<p>a</p>\n<script>\nlet x = 1;\n</script>\n";
+        let mut editor = editor_named(r"C:\page.html", html.as_bytes());
+        editor.event(
+            Event::Resized {
+                width: 800,
+                height: 600,
+            },
+            &mut ctx,
+        );
+        let mut pixels = vec![0u32; 800 * 600];
+        for _ in 0..5000 {
+            editor.event(Event::Wake, &mut ctx);
+            editor.paint(&mut pixels, 800, 600);
+            if editor.pane.syntax.as_ref().is_some_and(Syntax::highlighted) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let js = html.find("let").unwrap() as u64;
+        assert_eq!(editor.lang_at(js).map(|l| l.id), Some("javascript"));
+        // Line comments: `//` inside the script, `<!-- -->` outside.
+        editor.select_single(Selection::caret(js));
+        editor.event(key(VK_OEM_2, true, false), &mut ctx);
+        assert!(text(&editor).contains("// let x = 1;"), "{}", text(&editor));
+        editor.select_single(Selection::caret(0));
+        editor.event(key(VK_OEM_2, true, false), &mut ctx);
+        assert!(
+            text(&editor).starts_with("<!-- <p>a</p> -->"),
+            "{}",
+            text(&editor)
+        );
+    }
+
+    /// A fence below the view (no parsed layer yet) still comments in its
+    /// own language, also in a selection that crosses into it.
+    #[test]
+    fn offscreen_fences_comment_in_their_language() {
+        let mut ctx = Ctx::headless(800, 600, 96);
+        let md = format!(
+            "# Notes\n\n{}Text.\n```python\ndef hidden(): pass\n```\n",
+            "Paragraph.\n\n".repeat(400)
+        );
+        let mut editor = editor_named(r"C:\notes.md", md.as_bytes());
+        editor.event(
+            Event::Resized {
+                width: 800,
+                height: 600,
+            },
+            &mut ctx,
+        );
+        wait_for_syntax(&mut editor, &mut ctx);
+        let hidden = md.find("def hidden").unwrap() as u64;
+        editor.select_single(Selection::caret(hidden));
+        editor.event(key(VK_OEM_2, true, false), &mut ctx);
+        assert!(
+            text(&editor).contains("# def hidden(): pass"),
+            "{}",
+            text(&editor)
+        );
+        editor.event(key(VK_Z, true, false), &mut ctx);
+        let text_line = md.find("Text.").unwrap() as u64;
+        editor.select_single(Selection::new(text_line, hidden + 3));
+        editor.event(key(VK_OEM_2, true, false), &mut ctx);
+        let after = text(&editor);
+        assert!(after.contains("<!-- Text. -->"), "{after}");
+        assert!(after.contains("# def hidden(): pass"), "{after}");
+    }
+
+    /// After an edit far from the view the trees' positions there are
+    /// approximate: comments wait for the next parse instead of guessing.
+    #[test]
+    fn far_edits_defer_comments_until_the_next_parse() {
+        let mut ctx = Ctx::headless(800, 600, 96);
+        let md = format!(
+            "```js\nlet a = 1;\n```\n{}```js\nlet z = 1;\n```\n",
+            "Paragraph.\n\n".repeat(2000)
+        );
+        let mut editor = editor_named(r"C:\notes.md", md.as_bytes());
+        editor.event(
+            Event::Resized {
+                width: 800,
+                height: 600,
+            },
+            &mut ctx,
+        );
+        wait_for_syntax(&mut editor, &mut ctx);
+        let (a, z) = (
+            md.find("let a").unwrap() as u64,
+            md.find("let z").unwrap() as u64,
+        );
+        editor.pane.doc.select(Selections::new(
+            vec![Selection::caret(a), Selection::caret(z)],
+            0,
+        ));
+        type_text(&mut editor, &mut ctx, &" ".repeat(100));
+        let typed = text(&editor);
+        let z = typed.find("let z").unwrap() as u64;
+        editor.select_single(Selection::caret(z));
+        editor.event(key(VK_OEM_2, true, false), &mut ctx);
+        assert_eq!(text(&editor), typed, "nothing guessed");
+        assert!(
+            editor
+                .notice
+                .as_deref()
+                .unwrap()
+                .contains("still being parsed")
+        );
+        wait_for_syntax(&mut editor, &mut ctx);
+        editor.event(key(VK_OEM_2, true, false), &mut ctx);
+        let after = text(&editor);
+        assert!(
+            after.contains("// let z = 1;"),
+            "{}",
+            &after[after.len() - 40..]
+        );
+    }
+
+    /// Replaced and final trees go back to the syntax thread to be freed;
+    /// none are kept. (Lua: no other test here holds its highlighter.)
+    #[test]
+    fn replaced_trees_are_released_by_the_syntax_thread() {
+        let hl = rtm_syntax::highlighter(rtm_syntax::by_id("lua").unwrap().grammar).unwrap();
+        let base = Arc::strong_count(&hl);
+        let held = || Arc::strong_count(&hl) - base;
+        let until = |done: &dyn Fn() -> bool| {
+            for _ in 0..5000 {
+                if done() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            panic!("still held: {}", held());
+        };
+        let mut ctx = Ctx::headless(800, 600, 96);
+        let mut editor = editor_named(r"C:\src\a.lua", b"local a = 1\n");
+        editor.event(
+            Event::Resized {
+                width: 800,
+                height: 600,
+            },
+            &mut ctx,
+        );
+        wait_for_syntax(&mut editor, &mut ctx);
+        type_text(&mut editor, &mut ctx, "x");
+        wait_for_syntax(&mut editor, &mut ctx);
+        until(&|| held() == 1);
+        drop(editor);
+        until(&|| held() == 0);
+    }
+
+    /// Rows over the UI budget are highlighted by the thread again once the
+    /// full parse replaces the window of a large file.
+    #[test]
+    fn long_rows_are_fully_highlighted_after_the_window() {
+        let mut text = b"[".to_vec();
+        for n in 0..20_000 {
+            text.extend_from_slice(
+                format!("{{\"id\":{n},\"ok\":true,\"tags\":[\"a\",null]}},").as_bytes(),
+            );
+        }
+        text.extend_from_slice(b"0]");
+        assert!(text.len() as u64 > rtm_syntax::WINDOW_THRESHOLD);
+        let mut ctx = Ctx::headless(1100, 900, 96);
+        let mut editor = editor_named(r"C:\line.json", &text);
+        editor.event(
+            Event::Resized {
+                width: 1100,
+                height: 900,
+            },
+            &mut ctx,
+        );
+        let mut pixels = vec![0u32; 1100 * 900];
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            editor.event(Event::Wake, &mut ctx);
+            editor.paint(&mut pixels, 1100, 900);
+            if editor
+                .pane
+                .syntax
+                .as_ref()
+                .is_some_and(Syntax::fully_highlighted)
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("never fully highlighted");
+    }
+
+    #[test]
+    fn the_syntax_size_limit_follows_edits() {
+        let mut ctx = Ctx::headless(800, 600, 96);
+        let mut editor = editor_named(r"C:\src\main.rs", b"fn f() {}\n");
+        editor.settings.syntax_max_mib = 1;
+        editor.restart_syntax();
+        assert!(editor.pane.syntax.is_some());
+        let grow = Command {
+            tx: rtm_text::Transaction::single(rtm_text::Edit::insert(
+                editor.pane.doc.snapshot.len(),
+                vec![b' '; 2 << 20],
+            )),
+            kind: edit::EditKind::Other,
+            collapse: false,
+        };
+        editor.run(Some(grow), None);
+        editor.sync_syntax();
+        assert!(editor.pane.syntax.is_none() && editor.pane.doc.journal.is_none());
+        assert!(editor.status_text().0.contains("larger than 1 MiB"));
+        // Shrinking below the limit turns highlighting back on.
+        editor.event(key(VK_Z, true, false), &mut ctx);
+        assert!(editor.pane.syntax.is_some() && editor.pane.doc.journal.is_some());
+    }
+
+    #[test]
+    fn highlighting_reads_only_the_drawn_part_of_long_lines() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, &vec![b'x'; 16 << 20], false);
+        editor.size = (1100, 2160);
+        let (visible, margin) = editor.visible_bytes();
+        assert!(visible.end - visible.start <= ROW_SCAN_LIMIT as u64);
+        let rows = u64::from(editor.layout().rows);
+        assert!(margin.end - margin.start <= (2 * rows + 1) * ROW_SCAN_LIMIT as u64);
+        assert_eq!(editor.visible_ranges(), [0..ROW_SCAN_LIMIT as u64]);
+    }
+
+    #[test]
+    fn long_lines_are_highlighted_and_searched_past_the_scan_end() {
+        let mut text = b"[".to_vec();
+        while text.len() < 100_000 {
+            text.extend_from_slice(b"\"ab\",1,");
+        }
+        text.extend_from_slice(b"\"end\"]");
+        let len = text.len() as u64;
+        let mut ctx = Ctx::headless(800, 600, 96);
+        let mut editor = editor_named(r"C:\line.json", &text);
+        editor.event(
+            Event::Resized {
+                width: 800,
+                height: 600,
+            },
+            &mut ctx,
+        );
+        editor.event(key(VK_END, false, false), &mut ctx);
+        let ranges = editor.visible_ranges();
+        let last = ranges.last().cloned().unwrap();
+        assert!(
+            last.start > ROW_SCAN_LIMIT as u64 && last.end == len,
+            "{ranges:?}"
+        );
+        assert!(editor.viewport_rows(&(0..len)).iter().any(|r| r.end == len));
+        assert!(editor.status_text().1.contains("Col ~"));
+        let mut pixels = vec![0u32; 800 * 600];
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !editor.pane.syntax.as_ref().is_some_and(Syntax::highlighted) {
+            assert!(std::time::Instant::now() < deadline, "never highlighted");
+            editor.event(Event::Wake, &mut ctx);
+            editor.paint(&mut pixels, 800, 600);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let snapshot = editor.pane.doc.snapshot.clone();
+        let spans = editor
+            .pane
+            .syntax
+            .as_mut()
+            .unwrap()
+            .spans(&snapshot, &ranges);
+        assert!(
+            spans.iter().any(|s| s.start > len - 100),
+            "strings at the end are colored"
+        );
+        // Back at the line start the scan stops at the visible columns.
+        editor.event(key(VK_HOME, false, false), &mut ctx);
+        assert!(!editor.status_text().1.contains('~'));
+        assert_eq!(editor.visible_ranges(), [0..ROW_SCAN_LIMIT as u64]);
+    }
+
+    #[test]
+    fn alt_f4_quits_and_syntax_highlighting_toggles() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.perform(Action::ToggleSyntax, &mut ctx);
+        assert!(editor.status_text().1.contains("Syntax off"));
+        editor.perform(Action::ToggleSyntax, &mut ctx);
+        assert!(!editor.status_text().1.contains("Syntax"));
+        let alt = |vk| {
+            Event::Key(Key {
+                vk,
+                ctrl: false,
+                shift: false,
+                alt: true,
+            })
+        };
+        assert!(
+            !editor.event(alt(VK_SPACE), &mut ctx),
+            "the window menu stays"
+        );
+        assert!(!ctx.close_requested());
+        editor.event(key(VK_F1, false, false), &mut ctx);
+        assert!(editor.event(alt(VK_F4), &mut ctx));
+        assert!(ctx.close_requested(), "Quit works with the palette open");
+    }
+
+    #[test]
+    fn copy_path_and_name_of_the_active_file() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"text", true);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        let clipboard = |ctx: &mut Ctx| ctx.clipboard(clip::FORMAT).unwrap().0;
+        chord_k(&mut editor, &mut ctx, VK_P);
+        assert_eq!(clipboard(&mut ctx), r"C:\docs\test.txt");
+        editor.perform(Action::CopyFileName, &mut ctx);
+        assert_eq!(clipboard(&mut ctx), "test.txt", "also when read-only");
+        assert_eq!(text(&editor), "text");
+
+        // A relative command-line path is copied absolute and pastes as plain text.
+        let mut editor = editor_named("notes.md", b"");
+        editor.event(Event::Wake, &mut ctx);
+        editor.perform(Action::CopyFilePath, &mut ctx);
+        let absolute = std::env::current_dir().unwrap().join("notes.md");
+        assert_eq!(clipboard(&mut ctx), absolute.display().to_string());
+        editor.event(key(VK_V, true, false), &mut ctx);
+        assert_eq!(text(&editor), absolute.display().to_string());
+
+        let mut empty = empty_editor(false);
+        ctx.set_clipboard("kept", clip::FORMAT, &[]);
+        empty.perform(Action::CopyFilePath, &mut ctx);
+        assert_eq!(empty.notice.as_deref(), Some("No file is open"));
+        assert_eq!(clipboard(&mut ctx), "kept");
+    }
+
+    #[test]
+    fn palette_query_supports_editing_keys_and_paste() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"text", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        ctx.set_clipboard("redo\nsecond line", clip::FORMAT, &[]);
+        editor.event(key(VK_P, true, true), &mut ctx);
+        type_text(&mut editor, &mut ctx, "save");
+        editor.event(key(VK_A, true, false), &mut ctx);
+        type_text(&mut editor, &mut ctx, "undo");
+        assert_eq!(palette(&editor).query.as_str(), "undo");
+        editor.event(key(VK_A, true, false), &mut ctx);
+        editor.event(key(VK_V, true, false), &mut ctx);
+        assert_eq!(palette(&editor).query.as_str(), "redo");
+        assert_eq!(palette_labels(&editor)[0], "Edit: Redo");
+        editor.event(key(VK_HOME, false, false), &mut ctx);
+        editor.event(key(VK_DELETE, false, false), &mut ctx);
+        editor.event(key(VK_RIGHT, false, true), &mut ctx);
+        type_text(&mut editor, &mut ctx, "X");
+        assert_eq!(palette(&editor).query.as_str(), "Xdo");
+        editor.event(key(VK_END, false, false), &mut ctx);
+        editor.event(key(VK_LEFT, true, false), &mut ctx);
+        editor.event(key(VK_BACK, true, false), &mut ctx);
+        assert_eq!(
+            palette(&editor).query.as_str(),
+            "Xdo",
+            "nothing before the word"
+        );
+        editor.event(key(VK_ESCAPE, false, false), &mut ctx);
+        assert!(editor.popup.is_none());
+        assert_eq!(text(&editor), "text", "the document is unchanged");
+        assert_eq!(editor.pane.doc.selections.primary(), Selection::caret(0));
+    }
+
+    #[test]
+    fn popups_fit_small_zoomed_and_high_dpi_windows() {
+        let files = Arc::new(FakeFiles::default());
+        for (width, height, dpi) in [(400, 240, 96), (800, 480, 192), (600, 360, 144)] {
+            let mut editor = editor_on(&files, b"text", false);
+            editor.dpi = dpi;
+            editor.set_zoom(16);
+            let mut ctx = Ctx::headless(width, height, dpi);
+            editor.event(key(VK_P, true, true), &mut ctx);
+            assert!(
+                editor.ui_cell().height < editor.renderer.cell().height,
+                "popups do not zoom"
+            );
+            let mut pixels = vec![0u32; (width * height) as usize];
+            for _ in 0..COMMANDS.len() {
+                let p = palette(&editor);
+                let g = editor.palette_geometry(p);
+                assert!(g.panel.y >= 0 && g.panel.y + g.panel.h as i32 <= height as i32);
+                assert!(g.input.y + g.input.h as i32 <= g.list.y);
+                let row = p.selected.unwrap() - p.first;
+                assert!(row < g.rows, "{width}x{height}: the selection is visible");
+                editor.event(key(VK_DOWN, false, false), &mut ctx);
+            }
+            assert_eq!(
+                palette(&editor).selected,
+                Some(0),
+                "every command was reached"
+            );
+            editor.paint(&mut pixels, width, height);
+            assert!(!editor.list.popup.glyphs.is_empty());
+            editor.event(key(VK_ESCAPE, false, false), &mut ctx);
+            editor.perform(Action::About, &mut ctx);
+            let g = editor.panel_geometry(panel(&editor));
+            assert!(g.panel.y >= 0 && g.panel.y + g.panel.h as i32 <= height as i32);
+            assert!(g.lines >= 1);
+        }
+    }
+
+    #[test]
+    fn unchanged_popup_events_request_no_repaint() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"text", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(key(VK_P, true, true), &mut ctx);
+        for event in [
+            key(VK_LEFT, false, false),
+            key(VK_HOME, false, false),
+            key(VK_BACK, false, false),
+            key(0x7B, false, false),
+            Event::Char('\u{1}'),
+            Event::Wake,
+        ] {
+            let mut ctx = Ctx::headless(800, 600, 96);
+            editor.event(event.clone(), &mut ctx);
+            assert!(!ctx.redraw_requested(), "{event:?}");
+        }
+        for event in [
+            Event::Char('s'),
+            key(VK_DOWN, false, false),
+            key(VK_HOME, false, true),
+        ] {
+            let mut ctx = Ctx::headless(800, 600, 96);
+            editor.event(event.clone(), &mut ctx);
+            assert!(ctx.redraw_requested(), "{event:?}");
+        }
+    }
+
+    #[test]
+    fn palette_commands_run_before_their_state_is_saved() {
+        let dir = std::env::temp_dir().join(format!("rtm_editor_palette_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"one two", false);
+        editor.settings.user_dir = Some(dir.clone());
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(key(VK_P, true, true), &mut ctx);
+        type_text(&mut editor, &mut ctx, "selection select all");
+        editor.event(key(VK_RETURN, false, false), &mut ctx);
+        assert_eq!(editor.pane.doc.selections.primary(), Selection::new(0, 7));
+        assert_eq!(editor.store.as_mut().unwrap().settle(), None);
+        let saved = std::fs::read_to_string(dir.join(favorites::FILE_NAME)).unwrap();
+        assert!(saved.contains("editor.action.selectAll"), "{saved}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn about_links_open_and_shortcuts_list_every_command() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.size = ctx.size();
+        editor.perform(Action::About, &mut ctx);
+        let about = panel(&editor);
+        assert_eq!(about.lines[1].spans[1].0, VERSION);
+        let manifest_title = MANIFEST
+            .lines()
+            .next()
+            .unwrap()
+            .trim_start_matches('#')
+            .trim();
+        assert!(
+            about
+                .lines
+                .iter()
+                .any(|l| l.spans == [(manifest_title.to_owned(), Tone::Heading)]),
+            "the manifest is part of About"
+        );
+        assert_eq!(about.links.len(), about.lines.len());
+        let g = editor.panel_geometry(about);
+        let line = about
+            .links
+            .iter()
+            .position(|l| *l == Some(REPOSITORY_URL))
+            .unwrap();
+        editor.event(
+            click(g.body.x + 5, g.body.y + (line as u32 * g.line_h) as i32 + 1),
+            &mut ctx,
+        );
+        assert_eq!(ctx.requested_url(), Some(REPOSITORY_URL));
+        let mut pixels = vec![0u32; 800 * 600];
+        editor.paint(&mut pixels, 800, 600);
+        let images = &editor.list.popup.images;
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].width, editor.icon_side());
+        assert!(
+            images[0].pixels.iter().any(|p| p >> 24 == 0xFF),
+            "the icon is drawn"
+        );
+        editor.event(key(VK_ESCAPE, false, false), &mut ctx);
+        assert!(editor.popup.is_none());
+
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.perform(Action::Documentation, &mut ctx);
+        assert_eq!(ctx.requested_url(), Some(DOCUMENTATION_URL));
+
+        editor.perform(Action::KeyboardShortcuts, &mut ctx);
+        let rows: Vec<String> = panel(&editor)
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|(t, _)| t.as_str()).collect())
+            .collect();
+        for c in COMMANDS {
+            assert!(rows.iter().any(|r| r.starts_with(c.label)), "{}", c.label);
+        }
+        assert!(rows.iter().any(|r| r.ends_with("Ctrl+Shift+P, F1")));
+        editor.event(key(VK_END, false, false), &mut ctx);
+        let shortcuts = panel(&editor);
+        let visible = editor.panel_geometry(shortcuts).lines;
+        assert!(shortcuts.first > 0, "the list is longer than the window");
+        assert_eq!(shortcuts.first + visible, shortcuts.lines.len());
+    }
+
+    #[test]
+    fn scripted_keys_open_and_close_the_palette_then_exit() {
+        let files = Arc::new(FakeFiles::default());
+        files.put(&path(), b"x");
+        let mut settings = settings(false, false);
+        settings.bench = Some(bench::parse("Ctrl+Shift+P,Escape", "2", "").unwrap());
+        let mut editor = Editor::new(
+            Some(&path()),
+            Some(done(b"x")),
+            None,
+            renderer(),
+            96,
+            settings,
+            Trace::new(false),
+            files,
+            Arc::new(|| {}),
+        );
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Shown, &mut ctx);
+        let mut posted = ctx.posted_key();
+        let mut opened = 0;
+        while let Some(key) = posted {
+            let mut ctx = Ctx::headless(800, 600, 96);
+            editor.event(Event::Key(key), &mut ctx);
+            assert!(ctx.redraw_requested(), "{key:?} changes the frame");
+            assert!(!ctx.close_requested());
+            opened += usize::from(editor.popup.is_some());
+            let mut ctx = Ctx::headless(800, 600, 96);
+            editor.presented(&mut ctx);
+            posted = ctx.posted_key();
+            if posted.is_none() {
+                assert!(ctx.close_requested(), "the script ends the process");
+            }
+        }
+        assert_eq!(opened, 2);
+    }
+
+    #[test]
+    fn scripted_text_types_at_every_selected_match() {
+        let files = Arc::new(FakeFiles::default());
+        let mut settings = settings(false, false);
+        settings.bench =
+            Some(bench::parse("'x'", "2", r"Ctrl+F,Alt+R,'a\d',Alt+Enter,Escape,Right").unwrap());
+        let mut editor = Editor::new(
+            Some(&path()),
+            Some(done(b"a1 a2 b3 a4")),
+            None,
+            renderer(),
+            96,
+            settings,
+            Trace::new(false),
+            files,
+            Arc::new(|| {}),
+        );
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Shown, &mut ctx);
+        for _ in 0..5000 {
+            if ctx.close_requested() {
+                break;
+            }
+            let (posted_key, posted_char) = (ctx.posted_key(), ctx.posted_char());
+            ctx = Ctx::headless(800, 600, 96);
+            if let Some(key) = posted_key {
+                editor.event(Event::Key(key), &mut ctx);
+            } else if let Some(ch) = posted_char {
+                editor.event(Event::Char(ch), &mut ctx);
+            } else {
+                std::thread::sleep(Duration::from_millis(1));
+                editor.event(Event::Wake, &mut ctx);
+            }
+            if ctx.redraw_requested() {
+                editor.presented(&mut ctx);
+            }
+        }
+        assert!(ctx.close_requested(), "the script ends the process");
+        assert_eq!(text(&editor), "a1xx a2xx b3 a4xx");
+    }
+
+    fn mods(vk: u16, ctrl: bool, shift: bool, alt: bool) -> Event {
+        Event::Key(Key {
+            vk,
+            ctrl,
+            shift,
+            alt,
+        })
+    }
+
+    /// Delivers wake-ups until `done` holds.
+    fn pump(editor: &mut Editor, ctx: &mut Ctx, done: impl Fn(&Editor) -> bool) {
+        for _ in 0..5000 {
+            if done(editor) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            editor.event(Event::Wake, ctx);
+        }
+        panic!("the search thread did not answer");
+    }
+
+    fn counter(editor: &Editor) -> String {
+        let f = editor.pane.find.as_ref().unwrap();
+        f.counter(editor.pane.doc.selections.primary().range()).0
+    }
+
+    fn ranges(editor: &Editor) -> Vec<std::ops::Range<u64>> {
+        editor
+            .pane
+            .doc
+            .selections
+            .as_slice()
+            .iter()
+            .map(Selection::range)
+            .collect()
+    }
+
+    #[test]
+    fn search_starts_nothing_until_used() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"  cat", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        assert!(editor.pane.find.is_none() && editor.pane.search.is_none());
+        editor.event(key(VK_F, true, false), &mut ctx);
+        assert!(editor.find_focused());
+        assert!(
+            editor.pane.search.is_none(),
+            "an empty query starts no thread"
+        );
+        type_text(&mut editor, &mut ctx, "c");
+        assert!(editor.pane.search.is_some());
+    }
+
+    #[test]
+    fn search_box_finds_counts_navigates_and_closes() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"Cat dog cat\ncat", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(key(VK_F, true, false), &mut ctx);
+        type_text(&mut editor, &mut ctx, "cat");
+        pump(&mut editor, &mut ctx, |e| counter(e) == "1 of 3");
+        assert_eq!(ranges(&editor), [0..3]);
+        assert_eq!(text(&editor), "Cat dog cat\ncat", "typing went to the box");
+        editor.event(key(VK_RETURN, false, false), &mut ctx);
+        pump(&mut editor, &mut ctx, |e| counter(e) == "2 of 3");
+        assert_eq!(ranges(&editor), [8..11]);
+        editor.event(key(VK_RETURN, false, true), &mut ctx);
+        pump(&mut editor, &mut ctx, |e| ranges(e) == [0..3]);
+        editor.event(key(VK_F3, false, true), &mut ctx);
+        pump(&mut editor, &mut ctx, |e| ranges(e) == [12..15]);
+        assert!(
+            !find::highlights(editor.pane.find.as_deref(), &editor.pane.doc.snapshot)
+                .0
+                .is_empty()
+        );
+
+        // Match Case uses the UI scan: no wait for the next match.
+        editor.event(mods(VK_C, false, false, true), &mut ctx);
+        editor.event(key(VK_F3, false, false), &mut ctx);
+        assert_eq!(ranges(&editor), [8..11]);
+        pump(&mut editor, &mut ctx, |e| counter(e) == "1 of 2");
+
+        editor.event(key(VK_ESCAPE, false, false), &mut ctx);
+        assert!(!editor.find_open());
+        assert_eq!(ranges(&editor), [8..11], "the match stays selected");
+        editor.event(key(VK_F3, false, false), &mut ctx);
+        assert_eq!(ranges(&editor), [12..15], "F3 works with the box closed");
+    }
+
+    #[test]
+    fn modes_are_exclusive_and_errors_are_reported() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"a1 b22 a333", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(key(VK_F, true, false), &mut ctx);
+        editor.event(mods(VK_R, false, false, true), &mut ctx);
+        type_text(&mut editor, &mut ctx, "(");
+        pump(&mut editor, &mut ctx, |e| {
+            e.pane.find.as_ref().unwrap().error.is_some()
+        });
+        assert_eq!(counter(&editor), "No results");
+        assert!(!editor.search_busy(), "an invalid pattern ends the search");
+        editor.event(key(VK_BACK, false, false), &mut ctx);
+        type_text(&mut editor, &mut ctx, r"a\d+");
+        pump(&mut editor, &mut ctx, |e| counter(e) == "1 of 2");
+        editor.event(mods(VK_G, false, false, true), &mut ctx);
+        let f = editor.pane.find.as_ref().unwrap();
+        assert_eq!(f.mode, rtm_search::Mode::Glob);
+        editor.event(key(VK_A, true, false), &mut ctx);
+        type_text(&mut editor, &mut ctx, "b?2");
+        pump(&mut editor, &mut ctx, |e| counter(e) == "1 of 1");
+        assert_eq!(ranges(&editor), [3..6]);
+        editor.event(mods(VK_R, false, false, true), &mut ctx);
+        assert_eq!(
+            editor.pane.find.as_ref().unwrap().mode,
+            rtm_search::Mode::Regex
+        );
+    }
+
+    #[test]
+    fn replace_one_replace_all_and_undo() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"cat dog cat\ncat", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(key(VK_H, true, false), &mut ctx);
+        editor.event(key(VK_TAB, false, false), &mut ctx);
+        type_text(&mut editor, &mut ctx, "cat");
+        editor.event(key(VK_TAB, false, false), &mut ctx);
+        type_text(&mut editor, &mut ctx, "cow");
+        pump(&mut editor, &mut ctx, |e| ranges(e) == [0..3]);
+        editor.event(key(VK_RETURN, false, false), &mut ctx);
+        pump(&mut editor, &mut ctx, |e| ranges(e) == [8..11]);
+        assert_eq!(text(&editor), "cow dog cat\ncat");
+        editor.event(mods(VK_RETURN, true, false, true), &mut ctx);
+        pump(&mut editor, &mut ctx, |e| text(e) == "cow dog cow\ncow");
+        assert_eq!(editor.notice.as_deref(), Some("Replaced 2 occurrences"));
+        editor.event(key(VK_ESCAPE, false, false), &mut ctx);
+        editor.event(key(VK_Z, true, false), &mut ctx);
+        assert_eq!(
+            text(&editor),
+            "cow dog cat\ncat",
+            "Replace All is one undo step"
+        );
+
+        editor.pane.doc.locks.user = true;
+        editor.event(mods(VK_RETURN, true, false, true), &mut ctx);
+        assert!(
+            editor
+                .notice
+                .as_deref()
+                .unwrap()
+                .starts_with("Not editable")
+        );
+        assert!(editor.pane.pending_op.is_none());
+    }
+
+    #[test]
+    fn stale_replace_all_reruns_on_the_current_text() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"cat cat", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        editor.event(key(VK_H, true, false), &mut ctx);
+        type_text(&mut editor, &mut ctx, "dog");
+        editor.event(mods(VK_RETURN, true, false, true), &mut ctx);
+        // The text changes before the reply arrives.
+        let tx = rtm_text::Transaction::single(rtm_text::Edit::insert(7, b" cat".to_vec()));
+        editor.pane.doc.snapshot = editor.pane.doc.snapshot.apply(&tx).unwrap().0;
+        pump(&mut editor, &mut ctx, |e| text(e) == "dog dog dog");
+    }
+
+    #[test]
+    fn occurrences_cursor_undo_and_select_all() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"foo bar foo foobar foo", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        editor.event(key(VK_D, true, false), &mut ctx);
+        assert_eq!(
+            ranges(&editor),
+            [0..3],
+            "an empty selection selects its word"
+        );
+        editor.event(key(VK_D, true, false), &mut ctx);
+        assert_eq!(ranges(&editor), [0..3, 8..11], "whole words only");
+        editor.event(key(VK_K, true, false), &mut ctx);
+        assert!(editor.notice.as_deref().unwrap().contains("Ctrl+K"));
+        editor.event(key(VK_D, true, false), &mut ctx);
+        assert_eq!(ranges(&editor), [0..3, 19..22]);
+        editor.event(key(VK_U, true, false), &mut ctx);
+        assert_eq!(ranges(&editor), [0..3, 8..11]);
+        editor.event(key(VK_L, true, true), &mut ctx);
+        pump(&mut editor, &mut ctx, |e| e.pane.doc.selections.len() == 3);
+        type_text(&mut editor, &mut ctx, "x");
+        assert_eq!(text(&editor), "x bar x foobar x");
+        editor.event(key(VK_K, true, false), &mut ctx);
+        editor.event(key(VK_X, true, false), &mut ctx);
+        assert!(
+            editor
+                .notice
+                .as_deref()
+                .unwrap()
+                .contains("is not a command")
+        );
+    }
+
+    #[test]
+    fn select_all_above_the_limit_changes_nothing() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"a a a", false);
+        editor.settings.multi_cursor_limit = 2;
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        editor.event(key(VK_D, true, false), &mut ctx);
+        editor.event(key(VK_L, true, true), &mut ctx);
+        pump(&mut editor, &mut ctx, |e| e.notice.is_some());
+        assert!(editor.notice.as_deref().unwrap().starts_with("More than 2"));
+        assert_eq!(ranges(&editor), [0..1]);
+    }
+
+    /// Lets the search thread answer, then delivers its replies.
+    fn let_search_answer(editor: &mut Editor, ctx: &mut Ctx) {
+        for _ in 0..5 {
+            std::thread::sleep(Duration::from_millis(20));
+            editor.event(Event::Wake, ctx);
+        }
+    }
+
+    /// `cat cat` with the replace box open: find `cat`, replace with `dog`.
+    fn replace_box(text: &[u8]) -> (Editor, Ctx) {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, text, false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(key(VK_H, true, false), &mut ctx);
+        editor.event(key(VK_TAB, false, false), &mut ctx);
+        type_text(&mut editor, &mut ctx, "cat");
+        editor.event(key(VK_TAB, false, false), &mut ctx);
+        type_text(&mut editor, &mut ctx, "dog");
+        pump(&mut editor, &mut ctx, |e| ranges(e) == [0..3]);
+        (editor, ctx)
+    }
+
+    #[test]
+    fn changed_search_input_revokes_pending_replacements_and_selections() {
+        // Replace All, then the query changes before the reply.
+        let (mut editor, mut ctx) = replace_box(b"cat cat");
+        editor.event(mods(VK_RETURN, true, false, true), &mut ctx);
+        editor.event(key(VK_TAB, false, false), &mut ctx);
+        type_text(&mut editor, &mut ctx, "x");
+        let_search_answer(&mut editor, &mut ctx);
+        assert_eq!(text(&editor), "cat cat");
+        assert!(editor.pane.pending_op.is_none());
+
+        // Replace One, then Match Case changes.
+        let (mut editor, mut ctx) = replace_box(b"cat cat");
+        editor.event(key(VK_RETURN, false, false), &mut ctx);
+        editor.event(mods(VK_C, false, false, true), &mut ctx);
+        let_search_answer(&mut editor, &mut ctx);
+        assert_eq!(text(&editor), "cat cat");
+
+        // Replace All, then the replacement changes.
+        let (mut editor, mut ctx) = replace_box(b"cat cat");
+        editor.event(mods(VK_RETURN, true, false, true), &mut ctx);
+        type_text(&mut editor, &mut ctx, "s");
+        let_search_answer(&mut editor, &mut ctx);
+        assert_eq!(text(&editor), "cat cat");
+
+        // Select all matches, then Find in Selection changes the scope.
+        let (mut editor, mut ctx) = replace_box(b"cat cat");
+        editor.event(mods(VK_RETURN, false, false, true), &mut ctx);
+        editor.event(mods(VK_L, false, false, true), &mut ctx);
+        let_search_answer(&mut editor, &mut ctx);
+        assert_eq!(ranges(&editor), [0..3]);
+        assert!(
+            editor
+                .notice
+                .as_deref()
+                .unwrap()
+                .contains("nothing was selected")
+        );
+
+        // Unchanged input still applies.
+        let (mut editor, mut ctx) = replace_box(b"cat cat");
+        editor.event(mods(VK_RETURN, true, false, true), &mut ctx);
+        pump(&mut editor, &mut ctx, |e| text(e) == "dog dog");
+    }
+
+    #[test]
+    fn cursor_undo_never_restores_offsets_of_an_older_text() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"ab ab", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        editor.event(key(VK_D, true, false), &mut ctx);
+        editor.event(key(VK_D, true, false), &mut ctx);
+        assert_eq!(ranges(&editor), [0..2, 3..5]);
+        editor.event(Event::Char('\u{e9}'), &mut ctx);
+        let after = ranges(&editor);
+        editor.event(key(VK_U, true, false), &mut ctx);
+        assert_eq!(ranges(&editor), after, "states of the old text are dropped");
+        type_text(&mut editor, &mut ctx, "X");
+        assert_eq!(text(&editor), "\u{e9}X \u{e9}X");
+        // States recorded on the current text still restore.
+        editor.event(key(VK_HOME, false, false), &mut ctx);
+        editor.event(mods(VK_I, false, true, true), &mut ctx);
+        let before = ranges(&editor);
+        editor.event(key(VK_L, true, false), &mut ctx);
+        editor.event(key(VK_U, true, false), &mut ctx);
+        assert_eq!(ranges(&editor), before);
+    }
+
+    #[test]
+    fn dense_long_line_highlights_are_bounded_and_released_on_close() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, &vec![b'a'; 1 << 20], false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        editor.event(key(VK_F, true, false), &mut ctx);
+        editor.event(mods(VK_C, false, false, true), &mut ctx);
+        let started = std::time::Instant::now();
+        type_text(&mut editor, &mut ctx, "a");
+        let ui = started.elapsed();
+        let shown = find::highlights(editor.pane.find.as_deref(), &editor.pane.doc.snapshot)
+            .0
+            .len();
+        assert_eq!(
+            shown,
+            rtm_view::ROW_SCAN_LIMIT,
+            "one row as the view lays it out"
+        );
+        assert!(ui < Duration::from_millis(500), "{ui:?}");
+        editor.event(key(VK_ESCAPE, false, false), &mut ctx);
+        assert_eq!(editor.pane.find.as_ref().unwrap().match_capacity(), 0);
+    }
+
+    #[test]
+    fn next_and_previous_step_over_an_empty_current_match() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"a\nb", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(key(VK_F, true, false), &mut ctx);
+        editor.event(mods(VK_R, false, false, true), &mut ctx);
+        type_text(&mut editor, &mut ctx, "^");
+        pump(&mut editor, &mut ctx, |e| counter(e) == "1 of 2");
+        assert_eq!(ranges(&editor), [0..0]);
+        editor.event(key(VK_F3, false, false), &mut ctx);
+        pump(&mut editor, &mut ctx, |e| ranges(e) == [2..2]);
+        editor.event(key(VK_RETURN, false, false), &mut ctx);
+        pump(&mut editor, &mut ctx, |e| ranges(e) == [0..0]);
+        editor.event(key(VK_F3, false, true), &mut ctx);
+        pump(&mut editor, &mut ctx, |e| ranges(e) == [2..2]);
+        editor.event(key(VK_RETURN, false, true), &mut ctx);
+        pump(&mut editor, &mut ctx, |e| ranges(e) == [0..0]);
+    }
+
+    #[test]
+    fn an_old_index_reply_does_not_label_a_new_selection() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"cat cat cat", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(key(VK_F, true, false), &mut ctx);
+        type_text(&mut editor, &mut ctx, "cat");
+        pump(&mut editor, &mut ctx, |e| counter(e) == "1 of 3");
+        editor.event(key(VK_F3, false, false), &mut ctx);
+        pump(&mut editor, &mut ctx, |e| ranges(e) == [4..7]);
+        editor.event(key(VK_F3, false, false), &mut ctx);
+        pump(&mut editor, &mut ctx, |e| ranges(e) == [8..11]);
+        let f = editor.pane.find.as_ref().unwrap();
+        let reply = crate::search::Reply {
+            lane: crate::search::Lane::Find,
+            generation: f.generation,
+            snapshot: editor.pane.doc.snapshot.clone(),
+            outcome: crate::search::Outcome::Index {
+                at: 0,
+                index: Some(0),
+            },
+        };
+        editor.find_reply(reply);
+        assert_ne!(counter(&editor), "1 of 3");
+        pump(&mut editor, &mut ctx, |e| counter(e) == "3 of 3");
+    }
+
+    #[test]
+    fn add_next_occurrence_passes_already_selected_matches() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"cat cat cat", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        editor.pane.doc.select(Selections::new(
+            vec![Selection::new(0, 3), Selection::new(4, 7)],
+            0,
+        ));
+        editor.event(key(VK_D, true, false), &mut ctx);
+        assert_eq!(ranges(&editor), [0..3, 4..7, 8..11]);
+        editor.event(key(VK_D, true, false), &mut ctx);
+        assert_eq!(ranges(&editor), [0..3, 4..7, 8..11]);
+        assert_eq!(editor.notice.as_deref(), Some("No more occurrences"));
+    }
+
+    #[test]
+    fn highlights_stay_inside_find_in_selection() {
+        for match_case in [false, true] {
+            let files = Arc::new(FakeFiles::default());
+            let mut editor = editor_on(&files, b"cat cat", false);
+            let mut ctx = Ctx::headless(800, 600, 96);
+            editor.event(Event::Wake, &mut ctx);
+            editor.event(key(VK_D, true, false), &mut ctx);
+            editor.event(key(VK_F, true, false), &mut ctx);
+            editor.event(mods(VK_L, false, false, true), &mut ctx);
+            if match_case {
+                editor.event(mods(VK_C, false, false, true), &mut ctx);
+            }
+            pump(&mut editor, &mut ctx, |e| !e.search_busy());
+            let shown = find::highlights(editor.pane.find.as_deref(), &editor.pane.doc.snapshot).0;
+            assert_eq!(shown, [0..3], "match case {match_case}");
+        }
+    }
+
+    #[test]
+    fn line_ends_and_column_drags_refuse_above_the_limit_early() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, "x\n".repeat(50_000).as_bytes(), false);
+        editor.settings.multi_cursor_limit = 2;
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        editor.event(key(VK_A, true, false), &mut ctx);
+        let started = std::time::Instant::now();
+        editor.event(mods(VK_I, false, true, true), &mut ctx);
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(editor.notice.as_deref().unwrap().starts_with("At most 2"));
+        assert_eq!(editor.pane.doc.selections.len(), 1);
+        editor.event(key(VK_HOME, true, false), &mut ctx);
+        for _ in 0..3 {
+            editor.event(mods(VK_DOWN, true, true, true), &mut ctx);
+        }
+        assert_eq!(
+            editor.pane.doc.selections.len(),
+            2,
+            "the third line is refused"
+        );
+    }
+
+    #[test]
+    fn cursors_above_below_line_ends_and_columns() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"abc\nabc\nabc", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        editor.event(key(VK_RIGHT, false, false), &mut ctx);
+        editor.event(mods(VK_DOWN, true, false, true), &mut ctx);
+        editor.event(mods(VK_DOWN, true, false, true), &mut ctx);
+        assert_eq!(ranges(&editor), [1..1, 5..5, 9..9]);
+        type_text(&mut editor, &mut ctx, "-");
+        assert_eq!(text(&editor), "a-bc\na-bc\na-bc");
+        editor.event(key(VK_ESCAPE, false, false), &mut ctx);
+        assert_eq!(editor.pane.doc.selections.len(), 1);
+
+        editor.event(key(VK_HOME, true, false), &mut ctx);
+        editor.event(mods(VK_DOWN, true, true, true), &mut ctx);
+        editor.event(mods(VK_RIGHT, true, true, true), &mut ctx);
+        editor.event(mods(VK_RIGHT, true, true, true), &mut ctx);
+        assert_eq!(ranges(&editor), [0..2, 5..7]);
+        editor.event(key(VK_A, true, false), &mut ctx);
+        editor.event(mods(VK_I, false, true, true), &mut ctx);
+        assert_eq!(ranges(&editor), [4..4, 9..9, 14..14]);
+        editor.event(key(VK_L, true, false), &mut ctx);
+        assert_eq!(ranges(&editor), [0..5, 5..10, 10..14]);
+    }
+
+    #[test]
+    fn alt_click_adds_and_removes_carets_and_middle_drag_selects_columns() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"one two\nthree four\nfive", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Shown, &mut ctx);
+        let layout = editor.layout();
+        let cell = editor.renderer.cell();
+        let at = |col: i32, row: i32| {
+            (
+                layout.text.x + col * cell.width as i32,
+                layout.text.y + row * cell.height as i32 + 2,
+            )
+        };
+        let down = |(x, y): (i32, i32), alt: bool, middle: bool| Event::MouseDown {
+            x,
+            y,
+            clicks: 1,
+            shift: false,
+            ctrl: false,
+            alt,
+            middle,
+        };
+        editor.event(down(at(1, 0), false, false), &mut ctx);
+        editor.event(Event::MouseUp, &mut ctx);
+        editor.event(down(at(2, 1), true, false), &mut ctx);
+        editor.event(Event::MouseUp, &mut ctx);
+        assert_eq!(ranges(&editor), [1..1, 10..10]);
+        assert_eq!(editor.pane.doc.selections.primary().head, 10);
+        editor.event(down(at(2, 1), true, false), &mut ctx);
+        editor.event(Event::MouseUp, &mut ctx);
+        assert_eq!(ranges(&editor), [1..1]);
+
+        editor.event(down(at(1, 0), false, true), &mut ctx);
+        let (x, y) = at(3, 2);
+        editor.event(Event::MouseMove { x, y }, &mut ctx);
+        editor.event(Event::MouseUp, &mut ctx);
+        assert_eq!(ranges(&editor), [1..3, 9..11, 20..22]);
+        editor.event(key(VK_U, true, false), &mut ctx);
+        assert_eq!(ranges(&editor), [1..1], "a drag is one cursor-undo step");
+    }
+
+    #[test]
+    fn icon_scaling_averages_premultiplied_pixels() {
+        let source = [0xFF00_0000, 0, 0xFFFF_FFFF, 0];
+        assert_eq!(scale_image(&source, 2, 1), vec![0x8040_4040]);
+        let up = scale_image(&source, 2, 4);
+        assert_eq!(up.len(), 16);
+        assert_eq!(
+            (up[0], up[1], up[2], up[8]),
+            (source[0], source[0], 0, source[2])
+        );
+    }
+
+    /// `Ctrl+K` then `Ctrl+second`.
+    fn chord_k_ctrl(editor: &mut Editor, ctx: &mut Ctx, second: u16) {
+        editor.event(key(VK_K, true, false), ctx);
+        editor.event(key(second, true, false), ctx);
+    }
+
+    #[test]
+    fn line_commands_run_from_their_keys() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"one\ntwo\nthree", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        let alt = |vk, shift| mods(vk, false, shift, true);
+        editor.event(alt(VK_DOWN, false), &mut ctx);
+        assert_eq!(text(&editor), "two\none\nthree");
+        editor.event(alt(VK_UP, false), &mut ctx);
+        assert_eq!(text(&editor), "one\ntwo\nthree");
+        editor.event(alt(VK_DOWN, true), &mut ctx);
+        assert_eq!(
+            (text(&editor).as_str(), caret(&editor)),
+            ("one\none\ntwo\nthree", 4)
+        );
+        editor.event(key(VK_K, true, true), &mut ctx);
+        assert_eq!(
+            (text(&editor).as_str(), caret(&editor)),
+            ("one\ntwo\nthree", 4)
+        );
+        editor.event(key(VK_RETURN, true, false), &mut ctx);
+        assert_eq!(
+            (text(&editor).as_str(), caret(&editor)),
+            ("one\ntwo\n\nthree", 8)
+        );
+        editor.event(key(VK_RETURN, true, true), &mut ctx);
+        assert_eq!(text(&editor), "one\ntwo\n\n\nthree");
+        editor.event(key(VK_Z, true, false), &mut ctx);
+        editor.event(key(VK_Z, true, false), &mut ctx);
+        assert_eq!(text(&editor), "one\ntwo\nthree");
+        editor.event(key(VK_OEM_6, true, false), &mut ctx);
+        assert_eq!(text(&editor), "one\n    two\nthree");
+        editor.event(key(VK_OEM_4, true, false), &mut ctx);
+        assert_eq!(text(&editor), "one\ntwo\nthree");
+        editor.event(key(VK_F, true, false), &mut ctx);
+        editor.event(alt(VK_DOWN, false), &mut ctx);
+        assert_eq!(text(&editor), "one\ntwo\nthree", "not from the find box");
+        // Read-only refuses the edits.
+        let mut locked = editor_on(&files, b"one\ntwo", true);
+        locked.event(Event::Wake, &mut ctx);
+        locked.event(alt(VK_DOWN, false), &mut ctx);
+        assert_eq!(text(&locked), "one\ntwo");
+    }
+
+    #[test]
+    fn add_and_remove_line_comments_use_the_language() {
+        let mut ctx = Ctx::headless(800, 600, 96);
+        let mut editor = editor_named(r"C:\src\main.rs", b"a();\n// b();");
+        editor.event(Event::Wake, &mut ctx);
+        editor.event(key(VK_A, true, false), &mut ctx);
+        chord_k_ctrl(&mut editor, &mut ctx, VK_C);
+        assert_eq!(text(&editor), "// a();\n// // b();");
+        editor.event(key(VK_Z, true, false), &mut ctx);
+        chord_k_ctrl(&mut editor, &mut ctx, VK_U);
+        assert_eq!(text(&editor), "a();\nb();");
+    }
+
+    #[test]
+    fn scroll_page_shortcuts_panel_and_the_empty_state() {
+        let files = Arc::new(FakeFiles::default());
+        let lines = "x\n".repeat(200);
+        let mut editor = editor_on(&files, lines.as_bytes(), false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        editor.event(mods(VK_NEXT, false, false, true), &mut ctx);
+        assert_eq!(editor.scroll.top_row, editor.page());
+        editor.event(mods(VK_PRIOR, false, false, true), &mut ctx);
+        assert_eq!((editor.scroll.top_row, caret(&editor)), (0, 0));
+        chord_k_ctrl(&mut editor, &mut ctx, VK_S);
+        assert!(matches!(editor.popup, Some(Popup::Panel(_))));
+        // Scrolled to the end in a short window, then the window grows: a full last page.
+        let mut pixels = vec![0u32; 800 * 900];
+        editor.paint(&mut pixels, 800, 300);
+        editor.event(key(VK_END, false, false), &mut ctx);
+        editor.paint(&mut pixels, 800, 900);
+        let Some(Popup::Panel(panel)) = &editor.popup else {
+            panic!("panel closed");
+        };
+        let page = editor.panel_geometry(panel).lines;
+        assert!(panel.first > panel.lines.len() - page);
+        assert_eq!(editor.panel_first(panel), panel.lines.len() - page);
+
+        let mut empty = empty_editor(false);
+        empty.event(mods(VK_DOWN, false, false, true), &mut ctx);
+        assert_eq!(empty.notice.as_deref(), Some("No file is open"));
+        chord_k_ctrl(&mut empty, &mut ctx, VK_S);
+        assert!(matches!(empty.popup, Some(Popup::Panel(_))));
+        empty.popup = None;
+        let mut ctx = Ctx::headless(800, 600, 96);
+        empty.event(key(VK_F11, false, false), &mut ctx);
+        assert_eq!(ctx.requested_full_screen(), Some(true));
+        assert_eq!(empty.layout().scrollbar.w, 0, "no strip without a file");
+    }
+
+    #[test]
+    fn go_to_line_previews_and_places_the_caret() {
+        let files = Arc::new(FakeFiles::default());
+        let lines: String = (1..=200).map(|i| format!("line {i}\n")).collect();
+        let mut editor = editor_on(&files, lines.as_bytes(), false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        let s = editor.pane.doc.snapshot.clone();
+        let label = |editor: &Editor| palette(editor).choices.labels[0].clone();
+        editor.event(key(VK_G, true, false), &mut ctx);
+        assert_eq!(palette(&editor).mode, Mode::Line);
+        assert!(label(&editor).starts_with("Current line 1, column 1"));
+        type_text(&mut editor, &mut ctx, "150");
+        assert_eq!(label(&editor), "Go to line 150");
+        let top = editor.scroll.top_row;
+        assert!(top <= 149 && 149 < top + editor.page(), "previewed");
+        editor.event(key(VK_ESCAPE, false, false), &mut ctx);
+        assert_eq!(
+            (editor.scroll.top_row, caret(&editor)),
+            (0, 0),
+            "Escape restores"
+        );
+
+        editor.event(key(VK_G, true, false), &mut ctx);
+        type_text(&mut editor, &mut ctx, "20:3");
+        assert_eq!(label(&editor), "Go to line 20, column 3");
+        editor.event(key(VK_RETURN, false, false), &mut ctx);
+        assert!(editor.popup.is_none());
+        assert_eq!(caret(&editor), s.line_start(19).unwrap() + 2);
+
+        for (query, line) in [("-1", 200), ("999", 200), ("0", 0)] {
+            editor.event(key(VK_G, true, false), &mut ctx);
+            type_text(&mut editor, &mut ctx, query);
+            editor.event(key(VK_RETURN, false, false), &mut ctx);
+            assert_eq!(caret(&editor), s.line_start(line).unwrap(), "{query}");
+        }
+        // Not a line: Enter changes nothing.
+        let before = (caret(&editor), editor.scroll);
+        editor.event(key(VK_G, true, false), &mut ctx);
+        type_text(&mut editor, &mut ctx, "abc");
+        editor.event(key(VK_RETURN, false, false), &mut ctx);
+        assert_eq!((caret(&editor), editor.scroll), before);
+    }
+
+    #[test]
+    fn full_screen_follows_the_platform() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"text", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        let title = editor.layout().title;
+        assert!(title.h > 0 && editor.is_caption(title.x + 5, title.y + 2));
+        editor.event(key(VK_F11, false, false), &mut ctx);
+        assert_eq!(ctx.requested_full_screen(), Some(true));
+        assert_eq!(
+            editor.layout().title.h,
+            title.h,
+            "unchanged until the platform answers"
+        );
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::FullScreen(Ok(true)), &mut ctx);
+        assert!(ctx.redraw_requested());
+        assert_eq!(editor.layout().title.h, 0);
+        assert!(!editor.is_caption(5, 2));
+        editor.event(key(VK_F11, false, false), &mut ctx);
+        assert_eq!(ctx.requested_full_screen(), Some(false));
+        editor.event(Event::FullScreen(Ok(false)), &mut ctx);
+        assert_eq!(editor.layout().title, title);
+        editor.event(Event::FullScreen(Err("no monitor")), &mut ctx);
+        assert_eq!(
+            editor.notice.as_deref(),
+            Some("Full screen failed: no monitor")
+        );
+    }
+
+    /// A file that fits the view still scrolls to its last line; the slider
+    /// shows that and stays when the wheel returns to the top.
+    #[test]
+    fn the_scroll_slider_stays_when_the_wheel_returns_to_the_top() {
+        let files = Arc::new(FakeFiles::default());
+        let lines = "echo x\r\n".repeat(9) + "echo end";
+        let mut editor = editor_on(&files, lines.as_bytes(), false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        assert!(editor.page() > 10, "the file fits: {}", editor.page());
+        let wheel = |delta| Event::Wheel {
+            delta,
+            horizontal: false,
+            shift: false,
+            ctrl: false,
+        };
+        assert!(editor.slider().is_some(), "at the top");
+        editor.event(wheel(-120 * 2), &mut ctx);
+        assert!(editor.scroll.top_row > 0);
+        assert!(editor.slider().is_some(), "scrolled");
+        editor.event(wheel(120 * 10), &mut ctx);
+        assert_eq!(editor.scroll.top_row, 0);
+        assert!(editor.slider().is_some(), "back at the top");
+        // One line cannot scroll: no slider.
+        let mut one = editor_on(&files, b"a", false);
+        one.event(Event::Wake, &mut ctx);
+        assert!(one.slider().is_none());
+    }
+
+    #[test]
+    fn the_scroll_slider_drags_without_moving_the_caret() {
+        let files = Arc::new(FakeFiles::default());
+        let lines = "x\n".repeat(999);
+        let mut editor = editor_on(&files, lines.as_bytes(), false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        editor.select_single(Selection::caret(4));
+        let track = editor.layout().scrollbar;
+        assert_eq!(track.w, 14);
+        assert!(!editor.is_text(track.x + 1, track.y + 5));
+        let slider = editor.slider().unwrap();
+        assert_eq!(slider.y, track.y);
+        let press = |y| Event::MouseDown {
+            x: track.x + 2,
+            y,
+            clicks: 1,
+            shift: false,
+            ctrl: false,
+            alt: false,
+            middle: false,
+        };
+        // Pressing and releasing repaint once each (the slider's color).
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(press(slider.y + 2), &mut ctx);
+        assert!(ctx.redraw_requested());
+        assert_eq!(editor.scroll.top_row, 0);
+        let bottom = track.y + track.h as i32 + 50;
+        editor.event(
+            Event::MouseMove {
+                x: track.x,
+                y: bottom,
+            },
+            &mut ctx,
+        );
+        assert_eq!(editor.scroll.top_row, 999);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::MouseUp, &mut ctx);
+        assert!(ctx.redraw_requested());
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::MouseUp, &mut ctx);
+        assert!(!ctx.redraw_requested(), "nothing changed");
+        // A press on the strip centers the slider there.
+        let middle = track.y + track.h as i32 / 2;
+        editor.event(press(middle), &mut ctx);
+        editor.event(Event::MouseUp, &mut ctx);
+        let s = editor.slider().unwrap();
+        assert!((s.y + s.h as i32 / 2 - middle).abs() <= 2, "{s:?}");
+        assert_eq!(caret(&editor), 4);
+    }
+
+    #[test]
+    fn closing_or_replacing_the_file_drops_long_line_and_preview_state() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, &vec![b'x'; 128 * 1024], false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        editor.event(key(VK_END, false, false), &mut ctx);
+        editor.visible_ranges();
+        assert!(
+            editor.pane.seams.borrow().0.is_some(),
+            "the long row was scanned"
+        );
+        editor.event(key(VK_W, true, false), &mut ctx);
+        assert!(editor.no_file());
+        assert!(
+            editor.pane.seams.borrow().0.is_none(),
+            "the closed text is released"
+        );
+
+        // A file opened during a Go to Line preview starts at its top.
+        let lines: String = (1..=300).map(|i| format!("{i}\n")).collect();
+        let mut editor = editor_on(&files, lines.as_bytes(), false);
+        editor.event(Event::Wake, &mut ctx);
+        let file = TempFile::new("short.txt", b"one\ntwo");
+        editor.event(key(VK_G, true, false), &mut ctx);
+        type_text(&mut editor, &mut ctx, "200");
+        assert!(editor.scroll.top_row > 100);
+        drop_file(&mut editor, &mut ctx, &file.0, 0);
+        settle_open(&mut editor, &mut ctx);
+        assert_eq!(text(&editor), "one\ntwo");
+        assert_eq!(editor.scroll.top_row, 0);
+        assert!(editor.pane.line_preview.is_none() && editor.popup.is_none());
+    }
+
+    #[test]
+    fn alt_line_keys_need_the_text_focus() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"one\ntwo", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        let alt = |vk, shift| mods(vk, false, shift, true);
+        for open in [key(VK_P, true, true), key(VK_K, true, false)] {
+            editor.event(open, &mut ctx);
+            if editor.chord.is_some() {
+                editor.event(key(VK_S, true, false), &mut ctx);
+            }
+            assert!(editor.popup.is_some());
+            for event in [alt(VK_DOWN, false), alt(VK_DOWN, true), alt(VK_NEXT, false)] {
+                editor.event(event, &mut ctx);
+            }
+            assert_eq!(
+                (text(&editor).as_str(), editor.scroll.top_row),
+                ("one\ntwo", 0)
+            );
+            editor.event(key(VK_ESCAPE, false, false), &mut ctx);
+        }
+        // The palette still runs the command by name.
+        editor.event(key(VK_P, true, true), &mut ctx);
+        type_text(&mut editor, &mut ctx, "move line down");
+        editor.event(key(VK_RETURN, false, false), &mut ctx);
+        assert_eq!(text(&editor), "two\none");
+    }
+
+    #[test]
+    fn go_to_line_clamps_huge_columns_to_the_line_end() {
+        let files = Arc::new(FakeFiles::default());
+        let text = "\u{e9}\u{e9}\n\u{4e2d}x\ne\u{301}\nab";
+        let mut editor = editor_on(&files, text.as_bytes(), false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        let s = editor.pane.doc.snapshot.clone();
+        for line in 0..4u64 {
+            editor.event(key(VK_G, true, false), &mut ctx);
+            type_text(&mut editor, &mut ctx, &format!("{}:{}", line + 1, u64::MAX));
+            editor.event(key(VK_RETURN, false, false), &mut ctx);
+            assert_eq!(
+                caret(&editor),
+                edit::content_range(&s, line).end,
+                "line {line}"
+            );
+        }
+    }
+
+    /// Text of the popup layer's glyphs (search box and tooltip).
+    fn popup_text(editor: &mut Editor) -> String {
+        let mut pixels = vec![0u32; 1100 * 700];
+        editor.paint(&mut pixels, 1100, 700);
+        let layers = [&editor.list.popup, &editor.list.tooltip];
+        layers
+            .iter()
+            .flat_map(|l| l.glyphs.iter().map(|g| g.ch))
+            .collect()
+    }
+
+    #[test]
+    fn search_box_tooltips_follow_the_pointer() {
+        use rtm_view::FindHit;
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"text", false);
+        let mut ctx = Ctx::headless(1100, 700, 96);
+        editor.event(Event::Wake, &mut ctx);
+        // No box: pointer moves are ignored at once.
+        let mut ctx = Ctx::headless(1100, 700, 96);
+        assert!(!editor.event(Event::Hover { x: 900, y: 40 }, &mut ctx));
+        assert_eq!(
+            (ctx.requested_timer(), ctx.redraw_requested()),
+            (None, false)
+        );
+
+        editor.event(key(VK_H, true, false), &mut ctx);
+        let g = editor.find_geometry().unwrap();
+        let at = |hit| {
+            let r = g.rect(hit).unwrap();
+            Event::Hover {
+                x: r.x + r.w as i32 / 2,
+                y: r.y + r.h as i32 / 2,
+            }
+        };
+        let mut ctx = Ctx::headless(1100, 700, 96);
+        editor.event(at(FindHit::Toggle(0)), &mut ctx);
+        assert_eq!(ctx.requested_timer(), Some(find::TOOLTIP_MS));
+        assert!(!popup_text(&mut editor).contains("MatchCase"));
+        let mut ctx = Ctx::headless(1100, 700, 96);
+        editor.event(Event::Timer, &mut ctx);
+        assert!(ctx.redraw_requested());
+        assert!(popup_text(&mut editor).contains("MatchCase(Alt+C)"));
+        // Another part shows its tooltip at once; staying still changes nothing.
+        let mut ctx = Ctx::headless(1100, 700, 96);
+        editor.event(at(FindHit::Fold), &mut ctx);
+        assert!(ctx.redraw_requested() && ctx.requested_timer().is_none());
+        assert!(popup_text(&mut editor).contains("ToggleReplace"));
+        let mut ctx = Ctx::headless(1100, 700, 96);
+        editor.event(at(FindHit::Fold), &mut ctx);
+        assert!(!ctx.redraw_requested());
+        for (hit, text) in [
+            (FindHit::Toggle(1), "MatchWholeWord(Alt+W)"),
+            (FindHit::Toggle(2), "UseGlob(Alt+G)"),
+            (FindHit::Toggle(3), "UseRegularExpression(Alt+R)"),
+            (FindHit::Prev, "PreviousMatch(Shift+Enter)"),
+            (FindHit::Next, "NextMatch(Enter)"),
+            (FindHit::InSelection, "FindinSelection(Alt+L)"),
+            (FindHit::Close, "Close(Escape)"),
+            (FindHit::Preserve, "PreserveCase(Alt+P)"),
+            (FindHit::ReplaceOne, "Replace(Enter)"),
+            (FindHit::ReplaceAll, "ReplaceAll(Ctrl+Alt+Enter)"),
+        ] {
+            editor.event(at(hit), &mut ctx);
+            assert!(popup_text(&mut editor).contains(text), "{hit:?}");
+        }
+        // The fields are named; the count is not a part.
+        for (hit, text) in [
+            (FindHit::FindText, "Find"),
+            (FindHit::ReplaceText, "Replace"),
+        ] {
+            editor.event(at(hit), &mut ctx);
+            popup_text(&mut editor);
+            let tip: String = editor.list.tooltip.glyphs.iter().map(|g| g.ch).collect();
+            assert!(editor.tip.shown && tip == text, "{hit:?}: {tip}");
+        }
+        // Off the parts, out of the window, or a key: no tooltip.
+        let count = g.count;
+        let mut ctx = Ctx::headless(1100, 700, 96);
+        editor.event(
+            Event::Hover {
+                x: count.x + 5,
+                y: count.y + 5,
+            },
+            &mut ctx,
+        );
+        assert!(ctx.redraw_requested() && !editor.tip.shown);
+        editor.event(at(FindHit::Next), &mut ctx);
+        editor.event(Event::Timer, &mut ctx);
+        assert!(editor.tip.shown);
+        let mut ctx = Ctx::headless(1100, 700, 96);
+        editor.event(Event::MouseLeave, &mut ctx);
+        assert!(ctx.redraw_requested() && editor.tip == find::Tip::default());
+        editor.event(at(FindHit::Next), &mut ctx);
+        editor.event(Event::Timer, &mut ctx);
+        editor.event(key(VK_F3, false, false), &mut ctx);
+        assert!(!popup_text(&mut editor).contains("NextMatch"));
+        // A late timer after the pointer left shows nothing.
+        editor.event(at(FindHit::Prev), &mut ctx);
+        editor.event(Event::MouseLeave, &mut ctx);
+        let mut ctx = Ctx::headless(1100, 700, 96);
+        editor.event(Event::Timer, &mut ctx);
+        assert!(!ctx.redraw_requested() && !editor.tip.shown);
+    }
+
+    #[test]
+    fn ini_files_highlight_comment_and_list_their_sections() {
+        let mut ctx = Ctx::headless(800, 600, 96);
+        let mut editor = editor_named(r"C:\app\settings.ini", b"[core]\nname = x\n");
+        editor.event(
+            Event::Resized {
+                width: 800,
+                height: 600,
+            },
+            &mut ctx,
+        );
+        assert_eq!(editor.pane.language.map(|l| l.id), Some("ini"));
+        assert!(editor.status_text().1.contains("INI"));
+        wait_for_syntax(&mut editor, &mut ctx);
+        let property = editor.theme.syntax[rtm_syntax::Style::Property as usize];
+        assert_eq!(glyph_color(&mut editor, 'n'), property);
+        editor.select_single(Selection::caret(8));
+        editor.event(key(VK_OEM_2, true, false), &mut ctx);
+        assert_eq!(text(&editor), "[core]\n; name = x\n");
+    }
+    fn right_path() -> PathBuf {
+        PathBuf::from(r"C:\docs\right.txt")
+    }
+
+    /// An editor on `left` (in `files` at [`path`]) and `right` (at
+    /// [`right_path`]), the left pane focused.
+    fn pair_on(files: &Arc<FakeFiles>, left: &[u8], right: &[u8], read_only: bool) -> Editor {
+        let mut editor = editor_on(files, left, read_only);
+        open_right_with(&mut editor, files, right, info());
+        editor
+    }
+
+    /// [`pair_on`] with the right file read as `right_info` says.
+    fn pair_info(
+        files: &Arc<FakeFiles>,
+        left: &[u8],
+        right: &[u8],
+        right_info: FileInfo,
+    ) -> Editor {
+        let mut editor = editor_on(files, left, false);
+        open_right_with(&mut editor, files, right, right_info);
+        editor
+    }
+
+    fn open_right_with(editor: &mut Editor, files: &Arc<FakeFiles>, right: &[u8], info: FileInfo) {
+        files.put(&right_path(), right);
+        let (tx, rx) = mpsc::channel();
+        tx.send(LoadEvent::Done {
+            snapshot: Snapshot::from_bytes(right),
+            info,
+            baseline: Some(files.baseline(&right_path())),
+            read_ms: 0.0,
+        })
+        .unwrap();
+        drop(tx);
+        editor.open_right(Some(&right_path()), None, Some(Load::new(rx)), None);
+    }
+
+    fn side_text(editor: &Editor, side: Side) -> String {
+        let s = &editor.pane_of(side).doc.snapshot;
+        String::from_utf8(s.to_vec(0..s.len())).unwrap()
+    }
+
+    fn alt_key(vk: u16) -> Event {
+        Event::Key(Key {
+            vk,
+            ctrl: false,
+            shift: false,
+            alt: true,
+        })
+    }
+
+    /// Wakes the editor until neither pane waits for a save or an open.
+    fn settle_panes(editor: &mut Editor, ctx: &mut Ctx) {
+        pump(editor, ctx, |e| {
+            [&e.pane, &e.other].iter().all(|p| {
+                p.saving.is_none()
+                    && p.save_queued.is_none()
+                    && p.pending.is_none()
+                    && !matches!(p.status, LoadStatus::Loading { .. })
+            })
+        });
+    }
+
+    #[test]
+    fn two_files_open_side_by_side_and_keys_follow_the_focus() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = pair_on(&files, b"left", b"right", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        assert_eq!(editor.pane.side, Side::Left);
+        assert_eq!(
+            editor.shown_title,
+            format!("test.txt \u{2194} right.txt - {APP_NAME}")
+        );
+        type_text(&mut editor, &mut ctx, "1");
+        editor.event(key(VK_2, true, false), &mut ctx);
+        assert_eq!(editor.pane.side, Side::Right);
+        assert!(editor.status_text().1.starts_with("Right"));
+        type_text(&mut editor, &mut ctx, "2");
+        editor.event(key(VK_TAB, true, false), &mut ctx);
+        assert_eq!(editor.pane.side, Side::Left, "Ctrl+Tab switches the side");
+        editor.event(key(VK_2, true, false), &mut ctx);
+        editor.event(key(VK_1, true, false), &mut ctx);
+        assert_eq!(editor.pane.side, Side::Left);
+        assert_eq!(side_text(&editor, Side::Left), "1left");
+        assert_eq!(side_text(&editor, Side::Right), "2right");
+        assert!(
+            editor.shown_title.starts_with('\u{25CF}'),
+            "{}",
+            editor.shown_title
+        );
+    }
+
+    #[test]
+    fn a_click_focuses_the_pane_under_the_pointer_and_the_wheel_scrolls_both() {
+        let files = Arc::new(FakeFiles::default());
+        let text = "line\n".repeat(200);
+        let mut editor = pair_on(&files, text.as_bytes(), text.as_bytes(), false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        let (left, right) = (
+            editor.layout_of(Side::Left).text,
+            editor.layout_of(Side::Right).text,
+        );
+        assert!(
+            left.x + (left.w as i32) < right.x,
+            "the panes do not overlap"
+        );
+        // The panes share one view: the wheel scrolls both and keeps the focus.
+        editor.event(
+            Event::Wheel {
+                delta: -120,
+                horizontal: false,
+                shift: false,
+                ctrl: false,
+            },
+            &mut ctx,
+        );
+        assert_eq!(editor.scroll.top_row, 3);
+        assert_eq!(editor.view_lines().start, 3);
+        assert_eq!(editor.with_other(|e| e.view_lines().start), 3);
+        assert_eq!(editor.pane.side, Side::Left);
+        editor.event(click(right.x + 2, right.y + 2), &mut ctx);
+        editor.event(Event::MouseUp, &mut ctx);
+        assert_eq!(editor.pane.side, Side::Right);
+        editor.event(click(left.x + 2, left.y + 2), &mut ctx);
+        editor.event(Event::MouseUp, &mut ctx);
+        assert_eq!(editor.pane.side, Side::Left);
+    }
+
+    #[test]
+    fn read_only_locks_the_left_pane_and_diff_mode_both() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = pair_on(&files, b"left", b"right", true);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        type_text(&mut editor, &mut ctx, "x");
+        assert_eq!(
+            side_text(&editor, Side::Left),
+            "left",
+            "--read-only locks the left"
+        );
+        editor.event(key(VK_2, true, false), &mut ctx);
+        type_text(&mut editor, &mut ctx, "x");
+        assert_eq!(side_text(&editor, Side::Right), "xright");
+        // Diff mode locks both; leaving it restores each pane's own lock.
+        editor.perform(Action::ToggleDiffMode, &mut ctx);
+        type_text(&mut editor, &mut ctx, "y");
+        assert_eq!(side_text(&editor, Side::Right), "xright");
+        assert!(editor.status_text().1.contains("RO: diff mode"));
+        editor.perform(Action::ToggleDiffMode, &mut ctx);
+        type_text(&mut editor, &mut ctx, "y");
+        assert_eq!(side_text(&editor, Side::Right), "xyright");
+        assert!(editor.pane_of(Side::Left).doc.locks.user);
+        // `Alt+\` swaps the sides; `--read-only` stays with the left side.
+        editor.event(alt_key(VK_OEM_5), &mut ctx);
+        assert_eq!(side_text(&editor, Side::Left), "xyright");
+        assert!(editor.pane_of(Side::Left).doc.locks.user);
+        assert!(!editor.pane_of(Side::Right).doc.locks.user);
+        assert_eq!(
+            editor.pane.side,
+            Side::Left,
+            "the focus moves with the file"
+        );
+        assert!(editor.pane.dirty(), "unsaved changes survive the swap");
+    }
+
+    #[test]
+    fn save_all_saves_the_dirty_panes_one_at_a_time() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = pair_on(&files, b"left", b"right", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        type_text(&mut editor, &mut ctx, "1");
+        editor.event(key(VK_2, true, false), &mut ctx);
+        type_text(&mut editor, &mut ctx, "2");
+        editor.event(key(VK_K, true, false), &mut ctx);
+        editor.event(key(VK_S, false, false), &mut ctx);
+        assert!(
+            editor.pane.saving.is_some() != editor.other.saving.is_some(),
+            "one save at a time"
+        );
+        assert!(editor.pane.save_queued.is_some() || editor.other.save_queued.is_some());
+        settle_panes(&mut editor, &mut ctx);
+        assert_eq!(files.get(&path()).unwrap(), b"1left");
+        assert_eq!(files.get(&right_path()).unwrap(), b"2right");
+        assert!(!editor.pane.dirty() && !editor.other.dirty());
+    }
+
+    #[test]
+    fn a_find_box_stays_in_its_pane_when_drawn_and_clicked() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = pair_on(&files, b"left", b"right", false);
+        let (w, h) = (600, 400);
+        let mut ctx = Ctx::headless(w, h, 96);
+        editor.event(
+            Event::Resized {
+                width: w,
+                height: h,
+            },
+            &mut ctx,
+        );
+        editor.event(Event::Wake, &mut ctx);
+        editor.event(key(VK_2, true, false), &mut ctx);
+        editor.event(key(VK_F, true, false), &mut ctx);
+        let pane = editor.layout_of(Side::Right).pane();
+        let g = editor.find_geometry().unwrap();
+        assert_eq!(g.panel.x, pane.x, "a narrow pane: at its left edge");
+        let mut pixels = vec![0u32; (w * h) as usize];
+        editor.paint(&mut pixels, w, h);
+        let inside = |r: &rtm_view::Rect| pane.intersect(r) == Some(*r);
+        assert!(editor.list.popup.fills.iter().all(|f| inside(&f.rect)));
+        assert!(editor.list.popup.glyphs.iter().all(|g| inside(&g.clip)));
+        // From the left pane, a click on the box focuses the right pane and
+        // stays in the box: the caret does not move.
+        editor.event(key(VK_1, true, false), &mut ctx);
+        editor.event(click(g.field.x + 4, g.field.y + 4), &mut ctx);
+        editor.event(Event::MouseUp, &mut ctx);
+        assert_eq!(editor.pane.side, Side::Right);
+        assert_eq!(editor.pane.doc.selections.primary().head, 0);
+        // Left of the divider is the left pane's text.
+        let left = editor.layout_of(Side::Left).text;
+        editor.event(click(left.x + left.w as i32 - 2, g.field.y + 4), &mut ctx);
+        editor.event(Event::MouseUp, &mut ctx);
+        assert_eq!(editor.pane.side, Side::Left);
+        assert_eq!(editor.pane.doc.selections.primary().head, 4);
+    }
+
+    #[test]
+    fn session_keys_work_from_the_find_and_replace_fields() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = pair_on(&files, b"left", b"right", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        type_text(&mut editor, &mut ctx, "1");
+        // The left find field: Ctrl+2.
+        editor.event(key(VK_F, true, false), &mut ctx);
+        assert!(editor.find_focused());
+        editor.event(key(VK_2, true, false), &mut ctx);
+        assert_eq!(editor.pane.side, Side::Right);
+        type_text(&mut editor, &mut ctx, "2");
+        // The right replace field: Ctrl+Tab, then Ctrl+1 back from the left.
+        editor.event(key(VK_H, true, false), &mut ctx);
+        assert!(editor.find_focused());
+        editor.event(key(VK_TAB, true, false), &mut ctx);
+        assert_eq!(editor.pane.side, Side::Left);
+        assert!(editor.find_focused(), "the left field keeps its focus");
+        editor.event(key(VK_2, true, false), &mut ctx);
+        editor.event(key(VK_1, true, false), &mut ctx);
+        assert_eq!(editor.pane.side, Side::Left);
+        // Ctrl+K S saves both; the S is not typed into the field.
+        let query = editor.pane.find.as_ref().unwrap().find.as_str().to_owned();
+        editor.event(key(VK_K, true, false), &mut ctx);
+        editor.event(key(VK_S, false, false), &mut ctx);
+        assert_eq!(editor.pane.find.as_ref().unwrap().find.as_str(), query);
+        settle_panes(&mut editor, &mut ctx);
+        assert_eq!(files.get(&path()).unwrap(), b"1left");
+        assert_eq!(files.get(&right_path()).unwrap(), b"2right");
+        // A chord acting on the text does nothing from the field.
+        let selection = editor.pane.doc.selections.primary();
+        editor.event(key(VK_K, true, false), &mut ctx);
+        editor.event(key(VK_D, true, false), &mut ctx);
+        assert_eq!(editor.pane.doc.selections.primary(), selection);
+    }
+
+    #[test]
+    fn a_failed_save_stays_shown_after_the_other_pane_saves() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = pair_on(&files, b"left", b"right", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        type_text(&mut editor, &mut ctx, "1");
+        editor.event(key(VK_2, true, false), &mut ctx);
+        type_text(&mut editor, &mut ctx, "2");
+        editor.event(key(VK_1, true, false), &mut ctx);
+        // The left write fails; the right one waits until writing works again.
+        *files.create_error.lock().unwrap() = Some(std::io::ErrorKind::PermissionDenied);
+        let (open, gate) = mpsc::channel();
+        let gate = std::sync::Mutex::new(Some(gate));
+        *files.before_create.lock().unwrap() = Some(Box::new(move |f: &FakeFiles| {
+            *f.gate.lock().unwrap() = gate.lock().unwrap().take();
+        }));
+        editor.event(key(VK_K, true, false), &mut ctx);
+        editor.event(key(VK_S, false, false), &mut ctx);
+        pump(&mut editor, &mut ctx, |e| {
+            e.pane.saving.is_none() && e.other.saving.is_some()
+        });
+        let failure = editor.notice.clone().unwrap();
+        assert!(failure.starts_with("Cannot save"), "{failure}");
+        *files.create_error.lock().unwrap() = None;
+        open.send(()).unwrap();
+        settle_panes(&mut editor, &mut ctx);
+        assert_eq!(files.get(&path()).unwrap(), b"left");
+        assert_eq!(files.get(&right_path()).unwrap(), b"2right");
+        assert_eq!(editor.notice.as_deref(), Some(failure.as_str()));
+        assert!(editor.pane.dirty() && !editor.other.dirty());
+        // A later save shows its own result.
+        editor.event(key(VK_S, true, false), &mut ctx);
+        settle_panes(&mut editor, &mut ctx);
+        assert_eq!(editor.notice.as_deref(), Some("Saved"));
+    }
+
+    #[test]
+    fn a_late_symbol_reply_never_fills_the_other_panes_palette() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = pair_on(&files, b"fn left() {}", b"fn right() {}", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        let symbols = |name: &str| crate::syntax::Symbols {
+            list: vec![rtm_syntax::Symbol {
+                name: name.to_owned(),
+                kind: "function".to_owned(),
+                start: 3,
+            }],
+            truncated: false,
+            partial: false,
+        };
+        // The left pane asked for symbols; its palette was dismissed.
+        editor.pane.symbols_pending = true;
+        editor.symbols_for = Some(editor.pane.slot);
+        // The right pane opens Go to Symbol, as `open_symbols` does.
+        editor.event(key(VK_2, true, false), &mut ctx);
+        editor.pane.symbols_pending = true;
+        editor.symbols_for = Some(editor.pane.slot);
+        editor.open_palette(Mode::All);
+        let empty = crate::palette::Choices {
+            labels: Vec::new(),
+            hints: Vec::new(),
+            keep_order: true,
+            groups: Vec::new(),
+        };
+        editor.open_choices(Mode::Symbol, empty, 0);
+        // The right reply, then the late left one.
+        editor.show_symbols(&symbols("right"));
+        editor.with_other(|e| e.show_symbols(&symbols("left")));
+        assert_eq!(palette(&editor).choices.labels, ["right"]);
+        assert!(!editor.other.symbols_pending, "the late reply is consumed");
+        assert!(editor.other.symbol_offsets.is_empty());
+    }
+
+    #[test]
+    fn choosing_a_language_turns_highlighting_on_in_both_panes() {
+        let mut editor = editor_named(r"C:\a.rs", b"fn a() {}\n");
+        let (tx, rx) = mpsc::channel();
+        tx.send(done(b"fn b() {}\n")).unwrap();
+        drop(tx);
+        editor.open_right(Some(Path::new(r"C:\b.rs")), None, Some(Load::new(rx)), None);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        assert!(editor.pane.syntax.is_some() && editor.other.syntax.is_some());
+        editor.perform(Action::ToggleSyntax, &mut ctx);
+        assert!(editor.pane.syntax.is_none() && editor.other.syntax.is_none());
+        let rust = 1 + rtm_syntax::LANGUAGES
+            .iter()
+            .position(|l| l.name == "Rust")
+            .unwrap();
+        editor.set_language(rust);
+        editor.event(Event::Wake, &mut ctx);
+        assert!(editor.highlighting);
+        assert!(editor.pane.syntax.is_some(), "the chosen pane");
+        assert!(editor.other.syntax.is_some(), "the other pane");
+    }
+
+    #[test]
+    fn a_find_tooltip_shows_only_in_its_pane() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = pair_on(&files, b"left", b"right", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        editor.event(key(VK_F, true, false), &mut ctx);
+        editor.event(key(VK_2, true, false), &mut ctx);
+        editor.event(key(VK_F, true, false), &mut ctx);
+        let g = editor.find_geometry().unwrap();
+        let (x, y) = (g.field.x + 4, g.field.y + 4);
+        editor.event(Event::Hover { x, y }, &mut ctx);
+        editor.event(Event::Timer, &mut ctx);
+        assert!(editor.tip.shown);
+        let mut pixels = vec![0u32; 800 * 600];
+        editor.paint(&mut pixels, 800, 600);
+        let tooltip: String = editor.list.tooltip.glyphs.iter().map(|g| g.ch).collect();
+        assert_eq!(tooltip, "Find");
+    }
+
+    #[test]
+    fn save_current_after_a_conflict_waits_for_the_running_save() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = pair_on(&files, b"left", b"right", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        files.put(&path(), b"changed elsewhere");
+        type_text(&mut editor, &mut ctx, "1");
+        editor.event(key(VK_2, true, false), &mut ctx);
+        type_text(&mut editor, &mut ctx, "2");
+        editor.event(key(VK_1, true, false), &mut ctx);
+        // The left save conflicts; the right one, started next, blocks.
+        let (open, gate) = mpsc::channel();
+        let gate = std::sync::Mutex::new(Some(gate));
+        *files.before_create.lock().unwrap() = Some(Box::new(move |f: &FakeFiles| {
+            *f.gate.lock().unwrap() = gate.lock().unwrap().take();
+        }));
+        editor.event(key(VK_K, true, false), &mut ctx);
+        editor.event(key(VK_S, false, false), &mut ctx);
+        pump(&mut editor, &mut ctx, |e| {
+            e.pane.prompt.is_some() && e.other.saving.is_some()
+        });
+        assert_eq!(editor.pane.side, Side::Left);
+        assert!(matches!(editor.pane.prompt, Some(Prompt::Changed(_))));
+        // Save Current waits for the right save, and the disk check waits too.
+        let tx = fake_watcher(&mut editor);
+        editor.event(key(VK_S, false, false), &mut ctx);
+        assert!(editor.pane.saving.is_none());
+        assert!(matches!(editor.pane.save_queued, Some(Queued::Disk(_))));
+        report(&mut editor, &mut ctx, &tx);
+        assert_eq!(editor.pane.prompt, None);
+        open.send(()).unwrap();
+        settle_panes(&mut editor, &mut ctx);
+        assert_eq!(editor.pane.prompt, None);
+        assert_eq!(files.get(&path()).unwrap(), b"1left");
+        assert_eq!(files.get(&right_path()).unwrap(), b"2right");
+        assert!(!editor.pane.dirty() && !editor.other.dirty());
+    }
+
+    #[test]
+    fn closing_asks_once_for_every_dirty_file_and_saves_them() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = pair_on(&files, b"left", b"right", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        type_text(&mut editor, &mut ctx, "1");
+        editor.event(key(VK_2, true, false), &mut ctx);
+        type_text(&mut editor, &mut ctx, "2");
+        editor.event(Event::CloseRequested, &mut ctx);
+        let question = editor.status_text().0;
+        assert!(
+            question.starts_with("Save changes to test.txt and right.txt?"),
+            "{question}"
+        );
+        editor.event(key(VK_RETURN, false, false), &mut ctx);
+        for _ in 0..5000 {
+            if ctx.close_requested() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            editor.event(Event::Wake, &mut ctx);
+        }
+        assert!(ctx.close_requested(), "quits once both are saved");
+        assert_eq!(files.get(&path()).unwrap(), b"1left");
+        assert_eq!(files.get(&right_path()).unwrap(), b"2right");
+    }
+
+    #[test]
+    fn close_empties_both_panes_and_drops_open_where_they_land() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = pair_on(&files, b"left", b"right", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        editor.event(key(VK_W, true, false), &mut ctx);
+        assert!(editor.pane.path.is_none() && editor.other.path.is_none());
+        assert!(!ctx.close_requested());
+        assert_eq!(editor.shown_title, APP_NAME);
+        // One file opens in the pane under the drop point.
+        let (a, b) = (
+            TempFile::new("a.txt", b"aaa"),
+            TempFile::new("b.txt", b"bbb"),
+        );
+        let right = editor.layout_of(Side::Right).text;
+        let dropped = |path: &Path, second: Option<&Path>, point| {
+            Event::FilesDropped(Ok(Dropped {
+                path: path.to_path_buf(),
+                second: second.map(Path::to_path_buf),
+                others: 0,
+                point,
+            }))
+        };
+        editor.event(
+            dropped(&a.0, None, Some((right.x + 5, right.y + 5))),
+            &mut ctx,
+        );
+        settle_panes(&mut editor, &mut ctx);
+        assert_eq!(side_text(&editor, Side::Right), "aaa");
+        assert!(editor.pane_of(Side::Left).path.is_none());
+        assert_eq!(editor.pane.side, Side::Left, "a drop keeps the focus");
+        // Two files open as the left and the right one.
+        editor.event(dropped(&b.0, Some(&a.0), None), &mut ctx);
+        settle_panes(&mut editor, &mut ctx);
+        assert_eq!(side_text(&editor, Side::Left), "bbb");
+        assert_eq!(side_text(&editor, Side::Right), "aaa");
+    }
+
+    #[test]
+    fn drops_outside_the_pane_bodies_open_in_the_focused_pane() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = pair_on(&files, b"left", b"right", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        let file = TempFile::new("c.txt", b"ccc");
+        let l = editor.layout_of(Side::Right);
+        let x = l.text.x + 5;
+        let header = (x, l.title.y + 2);
+        let status = (x, l.status.y + 2);
+        let divider = (l.divider.x + 1, l.divider.y + 5);
+        for (focus, vk) in [(Side::Left, VK_1), (Side::Right, VK_2)] {
+            for point in [header, status, divider] {
+                editor.event(key(VK_W, true, false), &mut ctx);
+                editor.event(key(vk, true, false), &mut ctx);
+                editor.event(
+                    Event::FilesDropped(Ok(Dropped {
+                        path: file.0.clone(),
+                        second: None,
+                        others: 0,
+                        point: Some(point),
+                    })),
+                    &mut ctx,
+                );
+                settle_panes(&mut editor, &mut ctx);
+                assert_eq!(side_text(&editor, focus), "ccc", "{point:?}, {focus:?}");
+                assert!(editor.pane_of(focus.other()).path.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn a_rejected_startup_path_leaves_the_window_title() {
+        let folder = PathBuf::from(r"C:\docs");
+        let rejected = || LoadEvent::Rejected(r"C:\docs is a folder".to_owned());
+        let done = || LoadEvent::Done {
+            snapshot: Snapshot::from_bytes(b"text"),
+            info: info(),
+            baseline: None,
+            read_ms: 0.0,
+        };
+        for left_rejected in [true, false] {
+            let (left, right) = if left_rejected {
+                (rejected(), done())
+            } else {
+                (done(), rejected())
+            };
+            let left_file = if left_rejected {
+                folder.clone()
+            } else {
+                path()
+            };
+            let right_file = if left_rejected {
+                right_path()
+            } else {
+                folder.clone()
+            };
+            let mut editor = Editor::new(
+                Some(&left_file),
+                Some(left),
+                None,
+                renderer(),
+                96,
+                settings(false, false),
+                Trace::new(false),
+                Arc::new(FakeFiles::default()),
+                Arc::new(|| {}),
+            );
+            editor.open_right(Some(&right_file), Some(right), None, None);
+            let mut ctx = Ctx::headless(800, 600, 96);
+            editor.event(Event::Wake, &mut ctx);
+            let expected = if left_rejected {
+                window_title(None, Some(&right_file), false)
+            } else {
+                window_title(Some(&left_file), None, false)
+            };
+            assert_eq!(ctx.requested_title(), Some(expected.as_str()));
+            assert!(!expected.contains("docs"), "{expected}");
+        }
+    }
+
+    #[test]
+    fn headers_name_both_files_and_mark_unsaved_changes() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = pair_on(&files, b"left", b"right", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        editor.event(key(VK_2, true, false), &mut ctx);
+        type_text(&mut editor, &mut ctx, "x");
+        let mut pixels = vec![0u32; 800 * 600];
+        editor.paint(&mut pixels, 800, 600);
+        let layout = editor.layout();
+        let header = |from: i32, to: i32| -> String {
+            let mut glyphs: Vec<_> = editor
+                .list
+                .glyphs
+                .iter()
+                .filter(|g| layout.title.contains(g.x, g.y) && (from..to).contains(&g.x))
+                .collect();
+            glyphs.sort_by_key(|g| g.x);
+            glyphs.iter().map(|g| g.ch).collect()
+        };
+        let divider = layout.divider;
+        assert_eq!(header(0, divider.x), r"C:\docs\test.txt");
+        let right = header(divider.x + divider.w as i32, 800);
+        assert!(right.starts_with(r"C:\docs\right.txt●"), "{right}");
+        assert_eq!(
+            editor.list.overlays.len(),
+            1,
+            "only the focused pane has a caret"
+        );
+    }
+
+    /// Wakes the editor until the comparison of the current files is shown.
+    fn compared(editor: &mut Editor, ctx: &mut Ctx) -> String {
+        pump(editor, ctx, |e| {
+            e.comparison_text()
+                .is_some_and(|t| !t.starts_with("Comparing"))
+        });
+        editor.comparison_text().unwrap()
+    }
+
+    #[test]
+    fn exit_after_load_waits_for_the_first_comparison() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = pair_on(&files, b"a\nb\n", b"a\nc\n", false);
+        editor.settings.exit_after_load = true;
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Shown, &mut ctx);
+        assert!(
+            !ctx.close_requested(),
+            "both files are loaded, not compared"
+        );
+        for _ in 0..5000 {
+            if ctx.close_requested() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            editor.event(Event::Wake, &mut ctx);
+        }
+        assert!(ctx.close_requested());
+        assert_eq!(editor.comparison_text().unwrap(), "1 change");
+    }
+
+    /// The first frame is presented before the window is shown: the trace
+    /// must reach `first_frame` (on `Shown`) before the process exits.
+    #[test]
+    fn exit_after_load_waits_for_the_window_to_show() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = pair_on(&files, b"a\nb\n", b"a\nc\n", false);
+        editor.settings.exit_after_load = true;
+        let mut ctx = Ctx::headless(800, 600, 96);
+        compared(&mut editor, &mut ctx);
+        editor.presented(&mut ctx);
+        assert!(!ctx.close_requested(), "the window is not shown yet");
+        editor.event(Event::Shown, &mut ctx);
+        assert!(ctx.close_requested());
+    }
+
+    /// A pair of `left` (name, text) and `right` whose `loading` side has
+    /// read only a prefix; its loader's sender is returned.
+    fn pair_loading(
+        left: (&str, &[u8]),
+        right: &[u8],
+        loading: Side,
+        settings: Settings,
+    ) -> (Editor, mpsc::Sender<LoadEvent>) {
+        let (tx, rx) = mpsc::channel();
+        let prefix = |text: &[u8]| LoadEvent::Progress {
+            snapshot: Snapshot::from_bytes(&text[..1]),
+            loaded: 1,
+            total: text.len() as u64,
+        };
+        let (left_first, left_loads, right_first, right_loads) = match loading {
+            Side::Left => (prefix(left.1), Some(Load::new(rx)), done(right), None),
+            Side::Right => (done(left.1), None, prefix(right), Some(Load::new(rx))),
+        };
+        let mut editor = Editor::new(
+            Some(Path::new(left.0)),
+            Some(left_first),
+            left_loads,
+            renderer(),
+            96,
+            settings,
+            Trace::new(false),
+            Arc::new(FakeFiles::default()),
+            Arc::new(|| {}),
+        );
+        editor.open_right(Some(&right_path()), Some(right_first), right_loads, None);
+        (editor, tx)
+    }
+
+    #[test]
+    fn scripted_input_waits_for_both_files_and_their_comparison() {
+        let (left, right) = (b"a\nb\n".as_slice(), b"a\nc\n".as_slice());
+        for loading in [Side::Left, Side::Right] {
+            let mut settings = settings(false, false);
+            settings.bench = Some(bench::parse("Alt+F5", "1", "").unwrap());
+            let (mut editor, tx) = pair_loading((r"C:\docs\a.txt", left), right, loading, settings);
+            let mut ctx = Ctx::headless(800, 600, 96);
+            editor.event(Event::Shown, &mut ctx);
+            assert_eq!(ctx.posted_key(), None, "the {loading:?} file loads");
+            tx.send(done(if loading == Side::Left { left } else { right }))
+                .unwrap();
+            let mut started = false;
+            for _ in 0..5000 {
+                std::thread::sleep(Duration::from_millis(1));
+                ctx = Ctx::headless(800, 600, 96);
+                editor.event(Event::Wake, &mut ctx);
+                if ctx.posted_key().is_some() {
+                    assert!(editor.diff_fresh(), "the script starts on the comparison");
+                    started = true;
+                    break;
+                }
+            }
+            assert!(started, "the script starts once both files are compared");
+        }
+    }
+
+    #[test]
+    fn exit_after_highlight_waits_for_the_comparison() {
+        let right = b"fn main() { x }\n";
+        let mut settings = settings(false, false);
+        settings.exit_after_highlight = true;
+        let (mut editor, tx) = pair_loading(
+            (r"C:\src\main.rs", b"fn main() {}\n"),
+            right,
+            Side::Right,
+            settings,
+        );
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(
+            Event::Resized {
+                width: 800,
+                height: 600,
+            },
+            &mut ctx,
+        );
+        editor.event(Event::Shown, &mut ctx);
+        // Frames are drawn until one comes from a parse of the whole file.
+        let mut pixels = vec![0u32; 800 * 600];
+        for _ in 0..5000 {
+            editor.event(Event::Wake, &mut ctx);
+            editor.paint(&mut pixels, 800, 600);
+            if editor
+                .pane
+                .syntax
+                .as_ref()
+                .is_some_and(Syntax::fully_highlighted)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        editor.presented(&mut ctx);
+        assert!(editor.pane.marked.1, "the full highlight is marked");
+        assert!(!ctx.close_requested(), "the right file loads");
+        tx.send(done(right)).unwrap();
+        for _ in 0..5000 {
+            if ctx.close_requested() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            editor.event(Event::Wake, &mut ctx);
+        }
+        assert!(ctx.close_requested(), "the comparison ends the process");
+        assert!(editor.diff_fresh());
+    }
+
+    fn kinds(editor: &Editor, side: Side) -> Vec<(Option<u64>, rtm_view::RowKind)> {
+        compare::rows_of(&editor.compare, side, 0, 100)
+            .iter()
+            .map(|r| (r.line, r.kind))
+            .collect()
+    }
+
+    #[test]
+    fn a_diff_aligns_the_panes_with_changes_and_fillers() {
+        use rtm_view::RowKind::*;
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = pair_on(&files, b"a\nb\nc\n", b"a\nX\nY\nc\n", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        assert_eq!(compared(&mut editor, &mut ctx), "1 change");
+        assert_eq!(
+            kinds(&editor, Side::Left),
+            [
+                (Some(0), Same),
+                (Some(1), Removed),
+                (None, Filler),
+                (Some(2), Same),
+                (Some(3), Same)
+            ]
+        );
+        assert_eq!(
+            kinds(&editor, Side::Right),
+            [
+                (Some(0), Same),
+                (Some(1), Inserted),
+                (Some(2), Inserted),
+                (Some(3), Same),
+                (Some(4), Same)
+            ]
+        );
+        // Inner changes of the hunk in view come with the diff.
+        let rows = compare::rows_of(&editor.compare, Side::Left, 1, 1);
+        assert_eq!(rows[0].inner, [2..3]);
+        let mut pixels = vec![0; 800 * 600];
+        editor.paint(&mut pixels, 800, 600);
+        assert!(!editor.list.hatches.is_empty(), "the filler row is hatched");
+        // Only the right pane holds the scroll strip, with the change marked
+        // in both halves.
+        assert_eq!(editor.layout_of(Side::Left).scrollbar.w, 0);
+        assert!(editor.layout_of(Side::Right).scrollbar.w > 0);
+        let sides: Vec<Side> = editor.compare.marks().iter().map(|m| m.side).collect();
+        assert_eq!(sides, [Side::Left, Side::Right]);
+    }
+
+    #[test]
+    fn the_panes_scroll_together_over_the_rows() {
+        let files = Arc::new(FakeFiles::default());
+        let body = "line\n".repeat(100);
+        let right = format!("{}{body}", "new\n".repeat(10));
+        let mut editor = pair_on(&files, body.as_bytes(), right.as_bytes(), false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        compared(&mut editor, &mut ctx);
+        assert_eq!(editor.row_count(), 111);
+        editor.scroll_rows(10);
+        assert_eq!(editor.view_lines().start, 0, "left line 0 is on row 10");
+        assert_eq!(editor.with_other(|e| e.view_lines().start), 10);
+        // Revealing the left caret scrolls both panes by rows.
+        editor.event(key(VK_END, true, false), &mut ctx);
+        let last = editor.row_of(100);
+        assert_eq!(editor.scroll.top_row, last + 1 - editor.page());
+        editor.event(key(VK_HOME, true, false), &mut ctx);
+        assert_eq!(editor.scroll.top_row, 10, "left line 0 is on row 10");
+    }
+
+    #[test]
+    fn a_click_on_a_filler_row_places_the_caret_at_the_gap() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = pair_on(&files, b"a\nc\n", b"a\nb\nc\n", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        compared(&mut editor, &mut ctx);
+        let text = editor.layout_of(Side::Left).text;
+        let h = editor.renderer.cell().height as i32;
+        editor.event(click(text.x + 40, text.y + h + 2), &mut ctx);
+        editor.event(Event::MouseUp, &mut ctx);
+        assert_eq!(caret(&editor), 2, "the start of the line after the gap");
+    }
+
+    #[test]
+    fn stale_diff_replies_are_dropped() {
+        use crate::differ::{Lines, Reply};
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = pair_on(&files, b"a\nb\n", b"a\nc\n", false);
+        let left = editor.pane_of(Side::Left).doc.snapshot.clone();
+        let right = editor.pane_of(Side::Right).doc.snapshot.clone();
+        let generation = editor.compare.generation;
+        let reply = |generation, left: &Snapshot, hunks| Reply::Lines {
+            generation,
+            revision: 0,
+            left: left.clone(),
+            right: right.clone(),
+            lines: Lines::Full(
+                rtm_diff::Diff {
+                    hunks,
+                    complete: true,
+                },
+                Vec::new(),
+            ),
+            identical: false,
+        };
+        let hunk = || {
+            vec![rtm_diff::Hunk {
+                left: 1..2,
+                right: 1..2,
+            }]
+        };
+        editor.apply_diff(reply(generation + 1, &left, hunk()));
+        let other = Snapshot::from_bytes(b"a\nb\n");
+        editor.apply_diff(reply(generation, &other, hunk()));
+        assert_eq!(editor.comparison_text().unwrap(), "Comparing\u{2026}");
+        editor.apply_diff(reply(generation, &left, hunk()));
+        assert_eq!(editor.comparison_text().unwrap(), "1 change");
+    }
+
+    #[test]
+    fn an_edit_is_compared_again_and_a_swap_mirrors_the_diff() {
+        use rtm_view::RowKind::*;
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = pair_on(&files, b"a\nb\n", b"a\nb\n", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        assert_eq!(compared(&mut editor, &mut ctx), "Identical");
+        type_text(&mut editor, &mut ctx, "x");
+        editor.event(key(VK_RETURN, false, false), &mut ctx);
+        // The last diff stays drawn until the edited texts' one arrives, but
+        // its result is not presented as theirs.
+        assert_eq!(editor.comparison_text().unwrap(), "Comparing\u{2026}");
+        pump(&mut editor, &mut ctx, |e| {
+            e.comparison_text().as_deref() == Some("1 change")
+        });
+        assert_eq!(kinds(&editor, Side::Left)[0], (Some(0), Removed));
+        editor.perform(Action::SwapSides, &mut ctx);
+        assert_eq!(editor.comparison_text().unwrap(), "1 change");
+        assert_eq!(kinds(&editor, Side::Left)[0], (None, Filler));
+        assert_eq!(kinds(&editor, Side::Right)[0], (Some(0), Inserted));
+    }
+
+    #[test]
+    fn a_swap_asks_again_for_inner_changes_in_flight() {
+        use crate::differ::{Lines, Reply};
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = pair_on(&files, b"a\nb\n", b"a\nc\n", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.size = (800, 600);
+        // A diff without inner changes; its inner request goes out, and its
+        // reply is still in flight when the sides swap.
+        let diff = rtm_diff::Diff {
+            hunks: vec![rtm_diff::Hunk {
+                left: 1..2,
+                right: 1..2,
+            }],
+            complete: true,
+        };
+        editor.apply_diff(Reply::Lines {
+            generation: editor.compare.generation,
+            revision: 0,
+            left: editor.pane_of(Side::Left).doc.snapshot.clone(),
+            right: editor.pane_of(Side::Right).doc.snapshot.clone(),
+            lines: Lines::Full(diff, Vec::new()),
+            identical: false,
+        });
+        editor.sync_diff();
+        assert!(
+            compare::rows_of(&editor.compare, Side::Left, 1, 1)[0]
+                .inner
+                .is_empty()
+        );
+        editor.perform(Action::SwapSides, &mut ctx);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while compare::rows_of(&editor.compare, Side::Left, 1, 1)[0]
+            .inner
+            .is_empty()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the inner changes never arrived"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+            editor.event(Event::Wake, &mut ctx);
+        }
+        assert_eq!(side_text(&editor, Side::Left), "a\nc\n");
+        assert_eq!(
+            compare::rows_of(&editor.compare, Side::Left, 1, 1)[0].inner,
+            [2..3]
+        );
+    }
+
+    #[test]
+    fn crossing_the_size_limit_drops_the_shown_diff() {
+        use rtm_view::RowKind::*;
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = pair_on(&files, b"a\n", b"a\nb\n", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        assert_eq!(compared(&mut editor, &mut ctx), "1 change");
+        // As a text growing past the limit does.
+        editor.settings.diff.max_file_mib = 0;
+        editor.event(Event::Wake, &mut ctx);
+        assert_eq!(
+            editor.status_text().0,
+            "Not compared: a file is larger than 0 MiB"
+        );
+        assert_eq!(
+            kinds(&editor, Side::Right),
+            [(Some(0), Same), (Some(1), Same), (Some(2), Same)]
+        );
+        let mut pixels = vec![0; 800 * 600];
+        editor.paint(&mut pixels, 800, 600);
+        assert!(editor.compare.marks().is_empty());
+        assert!(editor.list.hatches.len() == 1, "the identity's filler row");
+        // Below the limit again, the files are compared again.
+        editor.settings.diff.max_file_mib = 50;
+        editor.event(Event::Wake, &mut ctx);
+        assert_eq!(compared(&mut editor, &mut ctx), "1 change");
+    }
+
+    #[test]
+    fn equal_texts_differ_from_identical_files() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = pair_on(&files, b"a\nb\n", b"a \r\nb\r\n", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        assert_eq!(
+            compared(&mut editor, &mut ctx),
+            "No changes (whitespace, line breaks or encoding differ)"
+        );
+        assert_eq!(editor.status_text().0, editor.comparison_text().unwrap());
+    }
+
+    #[test]
+    fn files_above_the_limit_are_shown_unaligned() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = pair_on(&files, b"a\n", b"b\nc\n", false);
+        editor.settings.diff.max_file_mib = 0;
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        assert_eq!(
+            editor.status_text().0,
+            "Not compared: a file is larger than 0 MiB"
+        );
+        assert!(editor.compare.marks().is_empty());
+        assert_eq!(
+            kinds(&editor, Side::Left),
+            [
+                (Some(0), rtm_view::RowKind::Same),
+                (Some(1), rtm_view::RowKind::Same),
+                (None, rtm_view::RowKind::Filler)
+            ]
+        );
+    }
+
+    #[test]
+    fn startup_waits_for_the_first_diff() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = pair_on(&files, b"a\n", b"b\n", false);
+        editor.await_diff(Duration::from_secs(10));
+        assert_eq!(editor.comparison_text().unwrap(), "1 change");
+        assert_eq!(editor.row_count(), 2);
+    }
+
+    fn press(vk: u16, ctrl: bool, shift: bool, alt: bool) -> Event {
+        Event::Key(Key {
+            vk,
+            ctrl,
+            shift,
+            alt,
+        })
+    }
+
+    #[test]
+    fn typing_keeps_the_panes_aligned_until_the_exact_diff() {
+        use rtm_view::RowKind::*;
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = pair_on(&files, b"a\nb\nc\n", b"a\nb\nc\n", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        assert_eq!(compared(&mut editor, &mut ctx), "Identical");
+        type_text(&mut editor, &mut ctx, "x");
+        editor.event(key(VK_RETURN, false, false), &mut ctx);
+        // In the frame of the edit: the edited lines pair as a change.
+        assert_eq!(
+            kinds(&editor, Side::Left)[..3],
+            [(Some(0), Removed), (Some(1), Removed), (Some(2), Same)]
+        );
+        assert_eq!(
+            kinds(&editor, Side::Right)[..3],
+            [(Some(0), Inserted), (None, Filler), (Some(1), Same)]
+        );
+        assert_eq!(editor.comparison_text().unwrap(), "Comparing\u{2026}");
+        // The re-diff of the edited region follows.
+        assert_eq!(compared(&mut editor, &mut ctx), "1 change");
+        assert_eq!(
+            kinds(&editor, Side::Left)[..2],
+            [(Some(0), Removed), (Some(1), Same)]
+        );
+        assert_eq!(
+            kinds(&editor, Side::Right)[..2],
+            [(None, Filler), (Some(0), Same)]
+        );
+    }
+
+    /// Distant edits and a multi-cursor edit before the worker answers:
+    /// one reply resolves every provisional change, exactly.
+    #[test]
+    fn edits_before_a_reply_are_all_resolved() {
+        let files = Arc::new(FakeFiles::default());
+        let text: String = (0..80).map(|i| format!("line {i}\n")).collect();
+        let mut editor = pair_on(&files, text.as_bytes(), text.as_bytes(), false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        assert_eq!(compared(&mut editor, &mut ctx), "Identical");
+        // Bottom up, so the offsets of the original text stay valid.
+        let at = |line: usize| text.find(&format!("line {line}\n")).unwrap() as u64;
+        editor.select_single(Selection::caret(at(60)));
+        type_text(&mut editor, &mut ctx, "x");
+        let carets = [20, 40].map(|line| Selection::caret(at(line) + 1));
+        editor.pane.doc.select(Selections::new(carets.to_vec(), 0));
+        type_text(&mut editor, &mut ctx, "y");
+        editor.select_single(Selection::caret(at(3)));
+        type_text(&mut editor, &mut ctx, "x");
+        assert_eq!(compared(&mut editor, &mut ctx), "4 changes");
+        let rows: Vec<u64> = (0..4)
+            .map(|i| editor.compare.alignment().hunk_rows(i).start)
+            .collect();
+        assert_eq!(rows, [3, 20, 40, 60]);
+        for row in 0..editor.row_count() {
+            let pair = editor.compare.alignment().row(row);
+            if pair.hunk.is_none() {
+                assert_eq!(pair.left, pair.right, "row {row} pairs one line");
+            }
+        }
+    }
+
+    #[test]
+    fn copies_go_both_ways_as_one_undo_step_in_the_target() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = pair_on(&files, b"a\nb\nc\n", b"a\nX\nc\n", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        assert_eq!(compared(&mut editor, &mut ctx), "1 change");
+        editor.select_single(Selection::caret(2));
+        editor.event(alt_key(VK_RIGHT), &mut ctx);
+        assert_eq!(side_text(&editor, Side::Right), "a\nb\nc\n");
+        assert_eq!(editor.status_text().0, "Copied 1 change to the right pane");
+        assert_eq!(compared(&mut editor, &mut ctx), "Identical");
+        // One undo step in the right pane; undo re-aligns.
+        editor.event(key(VK_2, true, false), &mut ctx);
+        editor.event(key(VK_Z, true, false), &mut ctx);
+        assert_eq!(side_text(&editor, Side::Right), "a\nX\nc\n");
+        assert_eq!(compared(&mut editor, &mut ctx), "1 change");
+        // From the right pane to the left.
+        editor.select_single(Selection::caret(2));
+        editor.event(alt_key(VK_LEFT), &mut ctx);
+        assert_eq!(side_text(&editor, Side::Left), "a\nX\nc\n");
+        editor.event(key(VK_1, true, false), &mut ctx);
+        editor.event(key(VK_Z, true, false), &mut ctx);
+        assert_eq!(side_text(&editor, Side::Left), "a\nb\nc\n");
+    }
+
+    /// Changes without lines on one side, at the start, at the end without
+    /// a final line break and against an empty document, both ways: Next
+    /// Change reaches them and the copy follows the gap.
+    #[test]
+    fn changes_without_lines_on_a_side_copy_both_ways() {
+        let cases: [(&[u8], &[u8], Side, &str); 6] = [
+            (b"a\nb", b"a", Side::Left, "a\nb"),
+            (b"a\nb", b"a", Side::Right, "a"),
+            (b"x\na\n", b"a\n", Side::Left, "x\na\n"),
+            (b"x\na\n", b"a\n", Side::Right, "a\n"),
+            (b"", b"a\nb", Side::Left, ""),
+            (b"", b"a\nb", Side::Right, "a\nb"),
+        ];
+        for (left, right, from, both) in cases {
+            let files = Arc::new(FakeFiles::default());
+            let mut editor = pair_on(&files, left, right, false);
+            let mut ctx = Ctx::headless(800, 600, 96);
+            editor.event(Event::Wake, &mut ctx);
+            assert_eq!(compared(&mut editor, &mut ctx), "1 change");
+            editor.focus(from);
+            editor.event(press(VK_F5, false, false, true), &mut ctx);
+            let to = if from == Side::Left {
+                VK_RIGHT
+            } else {
+                VK_LEFT
+            };
+            editor.event(alt_key(to), &mut ctx);
+            let texts = (
+                side_text(&editor, Side::Left),
+                side_text(&editor, Side::Right),
+            );
+            assert_eq!(texts, (both.to_owned(), both.to_owned()), "from {from:?}");
+        }
+    }
+
+    #[test]
+    fn copies_take_the_target_line_ending_and_check_its_encoding() {
+        let files = Arc::new(FakeFiles::default());
+        let crlf = FileInfo {
+            line_ending: LineEnding::CrLf,
+            ..info()
+        };
+        let mut editor = pair_info(&files, b"a\nb\nc\n", b"a\r\nX\r\nc\r\n", crlf);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        assert_eq!(compared(&mut editor, &mut ctx), "1 change");
+        editor.select_single(Selection::caret(2));
+        editor.event(alt_key(VK_RIGHT), &mut ctx);
+        assert_eq!(side_text(&editor, Side::Right), "a\r\nb\r\nc\r\n");
+        // A UTF-16 file cannot store bytes that are not UTF-8.
+        let utf16 = FileInfo {
+            encoding: Encoding::Utf16Le,
+            ..info()
+        };
+        let mut editor = pair_info(&files, b"a\n\xFF\n", b"a\nb\n", utf16);
+        editor.event(Event::Wake, &mut ctx);
+        assert_eq!(compared(&mut editor, &mut ctx), "1 change");
+        editor.select_single(Selection::caret(2));
+        editor.event(alt_key(VK_RIGHT), &mut ctx);
+        assert!(
+            editor
+                .status_text()
+                .0
+                .starts_with("Not copied: the lines hold bytes that are not UTF-8"),
+            "{}",
+            editor.status_text().0
+        );
+        assert_eq!(side_text(&editor, Side::Right), "a\nb\n");
+        assert!(!editor.pane_of(Side::Right).dirty());
+    }
+
+    #[test]
+    fn copies_into_a_locked_pane_are_refused() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = pair_on(&files, b"a\nb\n", b"a\nX\n", true);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        assert_eq!(compared(&mut editor, &mut ctx), "1 change");
+        editor.select_single(Selection::caret(2));
+        // `--read-only` locks the left pane: no arrow toward it.
+        assert_eq!(
+            editor.arrows(),
+            [Arrows {
+                row: 1,
+                right: true,
+                left: false
+            }]
+        );
+        editor.event(alt_key(VK_LEFT), &mut ctx);
+        assert_eq!(
+            editor.status_text().0,
+            "Not copied into the left pane: read-only"
+        );
+        assert_eq!(side_text(&editor, Side::Left), "a\nb\n");
+        // Diff mode locks both.
+        editor.perform(Action::ToggleDiffMode, &mut ctx);
+        assert!(editor.arrows().is_empty());
+        editor.event(alt_key(VK_RIGHT), &mut ctx);
+        assert_eq!(
+            editor.status_text().0,
+            "Not copied into the right pane: diff mode"
+        );
+        editor.perform(Action::ToggleDiffMode, &mut ctx);
+        editor.event(alt_key(VK_RIGHT), &mut ctx);
+        assert_eq!(side_text(&editor, Side::Right), "a\nb\n");
+    }
+
+    #[test]
+    fn a_copy_waits_for_the_diff_and_an_edit_cancels_it() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = pair_on(&files, b"a\nb\nc\nd\n", b"a\nX\nc\nd\n", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        assert_eq!(compared(&mut editor, &mut ctx), "1 change");
+        // An edit makes the diff provisional: the copy waits for the reply.
+        editor.select_single(Selection::caret(7));
+        type_text(&mut editor, &mut ctx, "y");
+        editor.select_single(Selection::caret(2));
+        editor.event(alt_key(VK_RIGHT), &mut ctx);
+        assert!(!editor.diff_fresh());
+        assert_eq!(side_text(&editor, Side::Right), "a\nX\nc\nd\n");
+        pump(&mut editor, &mut ctx, |e| {
+            side_text(e, Side::Right) == "a\nb\nc\nd\n"
+        });
+        // Another edit cancels a waiting copy.
+        editor.select_single(Selection::caret(8));
+        type_text(&mut editor, &mut ctx, "z");
+        editor.event(alt_key(VK_RIGHT), &mut ctx);
+        type_text(&mut editor, &mut ctx, "w");
+        assert_eq!(editor.status_text().0, "Copy cancelled: the text changed");
+        assert_eq!(compared(&mut editor, &mut ctx), "1 change");
+        assert_eq!(side_text(&editor, Side::Right), "a\nb\nc\nd\n");
+    }
+
+    #[test]
+    fn copy_and_next_moves_to_the_following_change() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = pair_on(&files, b"a\nb\nc\nd\ne\n", b"a\nB\nc\nD\ne\n", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        assert_eq!(compared(&mut editor, &mut ctx), "2 changes");
+        editor.select_single(Selection::caret(2));
+        editor.event(press(VK_RIGHT, true, false, true), &mut ctx);
+        assert_eq!(side_text(&editor, Side::Right), "a\nb\nc\nD\ne\n");
+        assert_eq!(caret(&editor), 6, "the caret is on the next change");
+        assert_eq!(compared(&mut editor, &mut ctx), "1 change");
+        editor.event(press(VK_RIGHT, true, false, true), &mut ctx);
+        assert_eq!(side_text(&editor, Side::Right), "a\nb\nc\nd\ne\n");
+        assert_eq!(
+            editor.status_text().0,
+            "Copied 1 change to the right pane; no other change"
+        );
+    }
+
+    #[test]
+    fn next_and_previous_change_wrap_and_reach_gaps() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = pair_on(&files, b"x\na\nb\nc\n", b"a\nB\nc\ny\n", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        assert_eq!(compared(&mut editor, &mut ctx), "3 changes");
+        let next = press(VK_F5, false, false, true);
+        let previous = press(VK_F5, false, true, true);
+        // From the first change: the second, the gap of the third, around.
+        let mut carets = Vec::new();
+        for event in [&next, &next, &next, &previous, &previous] {
+            editor.event(event.clone(), &mut ctx);
+            carets.push(caret(&editor));
+        }
+        assert_eq!(carets, [4, 8, 0, 8, 4]);
+        // The right pane reaches the left-only change at its gap.
+        editor.event(key(VK_2, true, false), &mut ctx);
+        editor.select_single(Selection::caret(0));
+        editor.event(previous.clone(), &mut ctx);
+        assert_eq!((caret(&editor), editor.compare.current), (0, Some(0)));
+        editor.event(previous, &mut ctx);
+        assert_eq!((caret(&editor), editor.compare.current), (6, Some(2)));
+    }
+
+    #[test]
+    fn a_click_on_a_filler_row_makes_its_change_current() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = pair_on(&files, b"a\nc\n", b"a\nb\nc\n", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        compared(&mut editor, &mut ctx);
+        let text = editor.layout_of(Side::Left).text;
+        let h = editor.renderer.cell().height as i32;
+        editor.event(click(text.x + 40, text.y + h + 2), &mut ctx);
+        editor.event(Event::MouseUp, &mut ctx);
+        assert_eq!((caret(&editor), editor.compare.current), (2, Some(0)));
+        editor.event(alt_key(VK_RIGHT), &mut ctx);
+        assert_eq!(side_text(&editor, Side::Right), "a\nc\n");
+        // A row without a change clears it.
+        editor.event(click(text.x + 40, text.y + 2), &mut ctx);
+        editor.event(Event::MouseUp, &mut ctx);
+        assert_eq!(editor.compare.current, None);
+    }
+
+    #[test]
+    fn divider_arrows_copy_their_change() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = pair_on(&files, b"a\nb\nc\n", b"a\nX\nc\n", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        compared(&mut editor, &mut ctx);
+        let mut pixels = vec![0; 800 * 600];
+        editor.paint(&mut pixels, 800, 600);
+        let layout = editor.layout();
+        let (div, h) = (layout.divider, editor.renderer.cell().height as i32);
+        let cw = editor.renderer.cell().width as i32;
+        let arrows: Vec<(char, i32, i32)> = editor
+            .list
+            .glyphs
+            .iter()
+            .filter(|g| div.contains(g.x, g.y))
+            .map(|g| (g.ch, g.x - div.x, (g.y - layout.text.y) / h))
+            .collect();
+        assert_eq!(arrows, [('\u{2192}', 0, 1), ('\u{2190}', 2 * cw, 1)]);
+        // The focus stays; the left arrow copies the right lines.
+        editor.event(click(div.x + 2 * cw + 2, layout.text.y + h + 2), &mut ctx);
+        editor.event(Event::MouseUp, &mut ctx);
+        assert_eq!(editor.pane.side, Side::Left);
+        assert_eq!(side_text(&editor, Side::Left), "a\nX\nc\n");
+        assert_eq!(compared(&mut editor, &mut ctx), "Identical");
+        assert!(editor.arrows().is_empty());
+    }
+
+    #[test]
+    fn a_simplified_diff_copies_its_coarse_change_whole() {
+        let files = Arc::new(FakeFiles::default());
+        // A permutation needs more work than a 0 ms budget allows.
+        let left: String = (0..2000).map(|i| format!("line {i}\n")).collect();
+        let right: String = (0..2000)
+            .map(|i| format!("line {}\n", i * 7 % 2000))
+            .collect();
+        let mut editor = pair_on(&files, left.as_bytes(), right.as_bytes(), false);
+        editor.settings.diff.max_computation_ms = 0;
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        let status = compared(&mut editor, &mut ctx);
+        assert!(
+            status.ends_with("; diff simplified after 0 s: changes are coarse"),
+            "{status}"
+        );
+        let coarse = editor
+            .compare
+            .alignment()
+            .hunks()
+            .iter()
+            .max_by_key(|h| h.left.end - h.left.start)
+            .unwrap()
+            .clone();
+        assert!(coarse.left.end - coarse.left.start > 10, "{coarse:?}");
+        let s = &editor.pane.doc.snapshot;
+        editor.select_single(Selection::caret(s.line_start(coarse.left.start).unwrap()));
+        editor.event(alt_key(VK_RIGHT), &mut ctx);
+        let lines = |text: &str| text.split('\n').map(str::to_owned).collect::<Vec<_>>();
+        let mut expected = lines(&right);
+        let range = coarse.right.start as usize..coarse.right.end as usize;
+        expected.splice(
+            range,
+            lines(&left)[coarse.left.start as usize..coarse.left.end as usize].to_vec(),
+        );
+        assert_eq!(side_text(&editor, Side::Right), expected.join("\n"));
+    }
+    #[test]
+    fn copies_and_moves_need_two_compared_files() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = editor_on(&files, b"a\n", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        editor.event(alt_key(VK_RIGHT), &mut ctx);
+        assert_eq!(
+            editor.status_text().0,
+            "Nothing to copy: open a file in each pane"
+        );
+        editor.event(press(VK_F5, false, false, true), &mut ctx);
+        assert_eq!(editor.status_text().0, "No changes");
+    }
+
+    /// Several changes copied into an empty file meet at its start; from an
+    /// empty file their ranges touch. Each copy is one undo step.
+    #[test]
+    fn copies_of_several_changes_into_and_from_an_empty_file() {
+        for full in ["a\n\na", "a\n\na\n", "\na\n\n"] {
+            let files = Arc::new(FakeFiles::default());
+            let mut editor = pair_on(&files, full.as_bytes(), b"", false);
+            let mut ctx = Ctx::headless(800, 600, 96);
+            editor.event(Event::Wake, &mut ctx);
+            compared(&mut editor, &mut ctx);
+            editor.event(key(VK_A, true, false), &mut ctx);
+            editor.event(alt_key(VK_RIGHT), &mut ctx);
+            assert_eq!(side_text(&editor, Side::Right), full, "into the empty file");
+            editor.event(key(VK_2, true, false), &mut ctx);
+            editor.event(key(VK_Z, true, false), &mut ctx);
+            assert_eq!(side_text(&editor, Side::Right), "");
+            editor.event(key(VK_Y, true, false), &mut ctx);
+            assert_eq!(side_text(&editor, Side::Right), full);
+            // From the empty left file, both ways.
+            for (to, left, right) in [(VK_RIGHT, "", ""), (VK_LEFT, full, full)] {
+                let mut editor = pair_on(&files, b"", full.as_bytes(), false);
+                editor.event(Event::Wake, &mut ctx);
+                compared(&mut editor, &mut ctx);
+                editor.event(key(VK_2, true, false), &mut ctx);
+                editor.event(key(VK_A, true, false), &mut ctx);
+                editor.event(alt_key(to), &mut ctx);
+                assert_eq!(
+                    (
+                        side_text(&editor, Side::Left),
+                        side_text(&editor, Side::Right)
+                    ),
+                    (left.to_owned(), right.to_owned()),
+                    "{full:?}"
+                );
+            }
+        }
+    }
+
+    /// A copy waiting for the diff runs only where it was pressed: moving
+    /// to another change, the caret or the focus cancels it.
+    #[test]
+    fn a_waiting_copy_is_cancelled_by_moving_on() {
+        let files = Arc::new(FakeFiles::default());
+        let right = "a\nB\nc\nD\ne\nf\n";
+        let mut editor = pair_on(&files, b"a\nb\nc\nd\ne\nf\n", right.as_bytes(), false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        compared(&mut editor, &mut ctx);
+        // Each time: an edit at the end makes the diff provisional, the
+        // copy of `b` waits, then the move.
+        let moves: [(Event, &str); 3] = [
+            (
+                press(VK_F5, false, false, true),
+                "another change was reached",
+            ),
+            (key(VK_DOWN, false, false), "the caret moved"),
+            (key(VK_2, true, false), "the focus moved"),
+        ];
+        for (event, reason) in moves {
+            editor.focus(Side::Left);
+            let end = editor.pane.doc.snapshot.len();
+            editor.select_single(Selection::caret(end));
+            type_text(&mut editor, &mut ctx, "x");
+            editor.select_single(Selection::caret(2));
+            editor.event(alt_key(VK_RIGHT), &mut ctx);
+            assert_eq!(
+                editor.status_text().0,
+                "The copy waits for the comparison\u{2026}"
+            );
+            editor.event(event, &mut ctx);
+            assert_eq!(editor.status_text().0, format!("Copy cancelled: {reason}"));
+            compared(&mut editor, &mut ctx);
+            assert_eq!(side_text(&editor, Side::Right), right, "{reason}");
+        }
+        // Unmoved, it copies the change it was pressed on.
+        editor.focus(Side::Left);
+        let end = editor.pane.doc.snapshot.len();
+        editor.select_single(Selection::caret(end));
+        type_text(&mut editor, &mut ctx, "x");
+        editor.select_single(Selection::caret(2));
+        editor.event(alt_key(VK_RIGHT), &mut ctx);
+        pump(&mut editor, &mut ctx, |e| {
+            side_text(e, Side::Right) == "a\nb\nc\nD\ne\nf\n"
+        });
+    }
+
+    #[test]
+    fn undoing_an_edit_of_no_bytes_keeps_identical() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = pair_on(&files, b"a\nb\n", b"a\nb\n", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        assert_eq!(compared(&mut editor, &mut ctx), "Identical");
+        editor.select_single(Selection::new(0, 1));
+        type_text(&mut editor, &mut ctx, "a");
+        assert_eq!(compared(&mut editor, &mut ctx), "Identical");
+        // New trees of the same bytes: no re-diff is needed.
+        editor.event(key(VK_Z, true, false), &mut ctx);
+        assert_eq!(editor.comparison_text().unwrap(), "Identical");
+        editor.event(key(VK_Y, true, false), &mut ctx);
+        assert_eq!(editor.comparison_text().unwrap(), "Identical");
+    }
+
+    #[test]
+    fn the_palette_dims_copies_toward_locked_panes() {
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = pair_on(&files, b"a\n", b"b\n", true);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        let state = |editor: &Editor| {
+            [
+                "royi.copyChangeToLeft",
+                "royi.copyChangeToLeftAndNext",
+                "diffEditor.revert",
+                "royi.copyChangeToRightAndNext",
+            ]
+            .map(|id| {
+                let def = commands::by_id(id).unwrap();
+                let locks = editor.pane.doc.locks;
+                enabled(def, locks, true, editor.editable_sides())
+            })
+        };
+        // The focused left pane is read-only: copies to the right still run.
+        assert_eq!(state(&editor), [false, false, true, true]);
+        editor.event(key(VK_2, true, false), &mut ctx);
+        assert_eq!(state(&editor), [false, false, true, true]);
+        editor.perform(Action::ToggleDiffMode, &mut ctx);
+        assert_eq!(state(&editor), [false; 4]);
+        editor.perform(Action::ToggleDiffMode, &mut ctx);
+        editor.event(key(VK_1, true, false), &mut ctx);
+        editor.perform(Action::ToggleReadOnly, &mut ctx);
+        assert_eq!(state(&editor), [true; 4]);
+    }
+
+    #[test]
+    fn toggling_ignore_trim_whitespace_compares_again() {
+        use rtm_view::RowKind::*;
+        let files = Arc::new(FakeFiles::default());
+        let mut editor = pair_on(&files, b"a\nm\nx\nn\nb\n", b"a \nm\nx\nn\nB\n", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        assert_eq!(compared(&mut editor, &mut ctx), "1 change");
+        assert!(!editor.status_text().1.contains(WHITESPACE_COMPARED));
+        editor.perform(Action::ToggleIgnoreTrimWhitespace, &mut ctx);
+        assert_eq!(editor.status_text().0, "Ignore trim whitespace off");
+        // The drawn diff stays until the one under the new option arrives.
+        assert_eq!(editor.comparison_text().unwrap(), "Comparing\u{2026}");
+        assert_eq!(kinds(&editor, Side::Left)[4], (Some(4), Removed));
+        assert_eq!(kinds(&editor, Side::Left)[0], (Some(0), Same));
+        // An edit before it arrives: the whole texts are compared again.
+        editor.select_single(Selection::caret(5));
+        type_text(&mut editor, &mut ctx, "y");
+        assert_eq!(compared(&mut editor, &mut ctx), "3 changes");
+        assert!(editor.status_text().1.contains(WHITESPACE_COMPARED));
+        assert_eq!(kinds(&editor, Side::Left)[0], (Some(0), Removed));
+        editor.perform(Action::ToggleIgnoreTrimWhitespace, &mut ctx);
+        assert_eq!(compared(&mut editor, &mut ctx), "2 changes");
+        assert!(!editor.status_text().1.contains(WHITESPACE_COMPARED));
+    }
+
+    /// A swap before the reply to a toggle mirrors the old option's diff
+    /// for display only: it is no merge authority, and the comparison under
+    /// the current option still replaces it.
+    #[test]
+    fn a_swap_before_the_option_reply_keeps_the_diff_stale() {
+        let files = Arc::new(FakeFiles::default());
+        let equivalent = "No changes (whitespace, line breaks or encoding differ)";
+        let mut editor = pair_on(&files, b"a\n", b"a \n", false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        assert_eq!(compared(&mut editor, &mut ctx), equivalent);
+        // Whitespace counts from now; the swap comes before the reply.
+        editor.perform(Action::ToggleIgnoreTrimWhitespace, &mut ctx);
+        editor.perform(Action::SwapSides, &mut ctx);
+        assert!(!editor.diff_fresh());
+        assert_eq!(editor.comparison_text().unwrap(), "Comparing\u{2026}");
+        // A copy waits for the strict diff, then copies its change.
+        editor.select_single(Selection::caret(0));
+        editor.event(alt_key(VK_RIGHT), &mut ctx);
+        assert_eq!(side_text(&editor, Side::Right), "a\n");
+        pump(&mut editor, &mut ctx, |e| {
+            side_text(e, Side::Right) == "a \n"
+        });
+        assert_eq!(compared(&mut editor, &mut ctx), "Identical");
+        // Trimming again, swapped before the reply: the change resolves.
+        let mut editor = pair_on(&files, b"a\n", b"a \n", false);
+        editor.event(Event::Wake, &mut ctx);
+        editor.perform(Action::ToggleIgnoreTrimWhitespace, &mut ctx);
+        assert_eq!(compared(&mut editor, &mut ctx), "1 change");
+        editor.perform(Action::ToggleIgnoreTrimWhitespace, &mut ctx);
+        editor.perform(Action::SwapSides, &mut ctx);
+        assert!(!editor.diff_fresh());
+        assert_eq!(compared(&mut editor, &mut ctx), equivalent);
+    }
+}

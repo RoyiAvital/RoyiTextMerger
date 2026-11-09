@@ -1,0 +1,33 @@
+[package]
+name = "rtm_app"
+description = "RoyiTextMerger application."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "RoyiTextMerger"
+path = "src/main.rs"
+
+[dependencies]
+rtm_assets = { path = "../rtm_assets" }
+rtm_diff = { path = "../rtm_diff" }
+rtm_edit = { path = "../rtm_edit" }
+rtm_platform = { path = "../rtm_platform" }
+rtm_render = { path = "../rtm_render" }
+rtm_search = { path = "../rtm_search" }
+rtm_spell = { path = "../rtm_spell" }
+rtm_syntax = { path = "../rtm_syntax" }
+rtm_text = { path = "../rtm_text" }
+rtm_view = { path = "../rtm_view" }
+saphyr-parser.workspace = true
+serde_json.workspace = true
+unicode-width.workspace = true
+xxhash-rust.workspace = true
+
+[build-dependencies]
+resvg.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

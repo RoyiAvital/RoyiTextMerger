@@ -1,0 +1,29 @@
+[book]
+title = "RoyiTextMerger"
+authors = ["Royi Avital"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "../target/book"
+
+[output.html]
+default-theme = "coal"
+preferred-dark-theme = "coal"
+git-repository-url = "https://github.com/RoyiAvital/RoyiTextMerger"
+edit-url-template = "https://github.com/RoyiAvital/RoyiTextMerger/edit/main/docs/{path}"
+site-url = "/RoyiTextMerger/"
+additional-css = ["theme/pagetoc.css", "theme/royi.css"]
+additional-js = ["theme/pagetoc.js", "theme/royi.js", "theme/mermaid.min.js", "theme/mermaid-init.js"]
+no-section-label = true
+sidebar-header-nav = false
+search = { enable = true }
+
+[preprocessor.pagetoc]
+command = "mdbook-pagetoc"
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
+
+
+

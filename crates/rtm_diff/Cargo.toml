@@ -1,0 +1,23 @@
+[package]
+name = "rtm_diff"
+description = "Line diff, inner changes and alignment of two snapshots."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+memchr.workspace = true
+rtm_text = { path = "../rtm_text" }
+xxhash-rust.workspace = true
+
+[dev-dependencies]
+divan.workspace = true
+imara-diff.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "diff"
+harness = false
+
+[lints]
+workspace = true

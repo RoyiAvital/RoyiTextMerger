@@ -1,0 +1,126 @@
+# Keyboard Shortcuts
+
+Shortcuts use the Windows key names shown below. Modifier keys must match the
+binding exactly. For example, `Ctrl+Shift+S` is not Save. Keys act on the focused
+pane.
+
+## Diff
+
+| Keys                              | Action                                                          |
+| --------------------------------- | --------------------------------------------------------------- |
+| `Alt+F5`; `Shift+Alt+F5`          | Go to the next; previous change (wraps)                         |
+| `Alt+Right`; `Alt+Left`           | Copy the changes at the caret to the right; to the left         |
+| `Ctrl+Alt+Right`; `Ctrl+Alt+Left` | Copy the changes to the right; to the left, then go to the next |
+| `Ctrl+1`; `Ctrl+2`                | Focus the left; right pane                                      |
+| `Ctrl+Tab`                        | Focus the other pane                                            |
+| `Alt+\`                           | Swap the files between the panes                                |
+
+`Diff: Toggle Diff Mode` and `Diff: Toggle Ignore Trim Whitespace` have no
+key; run them from the Command Palette. See
+[Comparing and Merging](comparing-and-merging.md).
+
+## Editing
+
+| Keys                                                                            | Action                                                                   |
+| ------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `Left` / `Right`; `Ctrl+Left` / `Ctrl+Right`                                    | Move by character; move by word                                          |
+| `Up` / `Down`; `PgUp` / `PgDn`                                                  | Move by line; move by page                                               |
+| `Home`; `End`                                                                   | Move to first non-blank, then line start; move to line end               |
+| `Ctrl+Home`; `Ctrl+End`                                                         | Move to start; move to end of file                                       |
+| `Shift` + any movement key; `Shift`+click                                       | Extend the selection                                                     |
+| `Ctrl+A`; `Esc`                                                                 | Select all; collapse selections                                          |
+| Double-click; triple-click                                                      | Select a word; select a line                                             |
+| `Backspace` / `Delete`; `Ctrl+Backspace` / `Ctrl+Delete`                        | Delete a character; delete a word                                        |
+| `Enter`                                                                         | Insert a line break and keep indentation                                 |
+| `Tab`; `Shift+Tab`                                                              | Insert indentation; indent or outdent selected lines                     |
+| `Ctrl+]`; `Ctrl+[`                                                              | Indent; outdent the touched lines (also for a caret)                     |
+| `Alt+Up` / `Alt+Down`                                                           | Move the touched lines up / down                                         |
+| `Shift+Alt+Up` / `Shift+Alt+Down`                                               | Copy the touched lines up / down                                         |
+| `Ctrl+Shift+K`                                                                  | Delete the touched lines                                                 |
+| `Ctrl+Enter`; `Ctrl+Shift+Enter`                                                | Insert a line below; above                                               |
+| `Ctrl+G`                                                                        | Go to line: `N`, `N:C` or `N,C`, `-N` from the end (`Esc` restores)      |
+| `Insert`                                                                        | Toggle overtype mode                                                     |
+| `Ctrl+Z`; `Ctrl+Y` / `Ctrl+Shift+Z`                                             | Undo; redo                                                               |
+| `Ctrl+C` / `Ctrl+X` / `Ctrl+V`                                                  | Copy; cut; paste. Copy or cut the current line when nothing is selected. |
+| `Ctrl+S`; `Ctrl+K S`                                                            | Save the focused file; save every file with unsaved changes              |
+| `Ctrl+K P`                                                                      | Copy the full path of the focused file                                   |
+| `Ctrl+W`; `Ctrl+F4`                                                             | Close both files and leave empty panes (unsaved changes ask first)       |
+| `Alt+F4`; `Ctrl+Shift+W`                                                        | Quit the application (unsaved changes ask first)                         |
+| `Ctrl+Shift+P`; `F1`                                                            | Open the Command Palette                                                 |
+| `Ctrl+P`                                                                        | Show recent and favorite commands                                        |
+| `Ctrl+Space` (palette)                                                          | Add or remove the selected command from favorites                        |
+| `Up` / `Down` / `PgUp` / `PgDn` (palette)                                       | Move through palette entries                                             |
+| `Enter` or click (palette); `Esc`                                               | Run the selected command; close the palette                              |
+| Wheel; `Ctrl+Up` / `Ctrl+Down`                                                  | Scroll vertically                                                        |
+| `Alt+PgUp` / `Alt+PgDn`                                                         | Scroll a page; the caret stays                                           |
+| Drag the slider; press the strip at the right edge                              | Scroll; jump to that place                                               |
+| `Shift`+wheel                                                                   | Scroll horizontally                                                      |
+| `Ctrl+=` / `Ctrl+Shift+=` / `Ctrl+Numpad+`; `Ctrl+-` / `Ctrl+Numpad-`; `Ctrl+0` | Zoom in; zoom out; reset zoom                                            |
+| `Ctrl`+wheel                                                                    | Zoom in or out                                                           |
+| `F11`                                                                           | Toggle full screen (the status line stays)                               |
+| `Ctrl+K Ctrl+S`                                                                 | Show the keyboard shortcuts                                              |
+
+Mouse clicks place the caret and focus their pane. `Shift`+click extends the current selection.
+Commands without a shortcut are available by name in the Command Palette, for
+example `File: Copy File Name`, which copies the file name.
+
+## Search and Replace
+
+| Keys                                       | Action                                              |
+| ------------------------------------------ | --------------------------------------------------- |
+| `Ctrl+F`; `Ctrl+H`                         | Open the search box; open it with the replace field |
+| `Enter` / `Shift+Enter`; `F3` / `Shift+F3` | Next / previous match                               |
+| `Alt+Enter`                                | Select all matches                                  |
+| `Alt+C`; `Alt+W`                           | Toggle Match Case; toggle Whole Word                |
+| `Alt+G`; `Alt+R`                           | Toggle Glob; toggle RegEx. Both off is Text.        |
+| `Alt+L`                                    | Toggle Find in Selection                            |
+| `Enter` or `Ctrl+Shift+1` (replace field)  | Replace the current match and go to the next        |
+| `Ctrl+Alt+Enter`                           | Replace all matches in one undo step                |
+| `Alt+P`                                    | Toggle Preserve Case                                |
+| `Esc`                                      | Close the search box                                |
+
+Glob: `?` matches one character; `*` matches the shortest text within a line,
+and a trailing `*` matches the rest of the line. Replacements use the VS Code
+syntax: `$1`, `$<name>`, `$0`, `$$`, `\n`, `\t`, `\u`, `\l`, `\U` and `\L`.
+
+## Multiple Cursors
+
+| Keys                                        | Action                                                 |
+| ------------------------------------------- | ------------------------------------------------------ |
+| `Ctrl+D`; `Ctrl+K Ctrl+D`                   | Add the next occurrence; move the last selection to it |
+| `Ctrl+Shift+L`; `Ctrl+F2`                   | Select all occurrences                                 |
+| `Ctrl+Alt+Up` / `Ctrl+Alt+Down`             | Add a cursor above / below                             |
+| `Shift+Alt+I`                               | Add cursors to the ends of the selected lines          |
+| `Ctrl+L`                                    | Select the line, then extend by lines                  |
+| `Ctrl+U`                                    | Undo the last cursor operation                         |
+| `Alt`+click                                 | Add or remove a cursor                                 |
+| `Shift+Alt`+drag; middle-drag               | Column selection                                       |
+| `Ctrl+Shift+Alt` + arrows / `PgUp` / `PgDn` | Column selection by keys                               |
+
+At most `editor.multiCursorLimit` selections (10,000 by default) are created;
+larger requests are refused with a message on the status line.
+
+## Code
+
+| Keys                                                     | Action                                                                    |
+| -------------------------------------------------------- | ------------------------------------------------------------------------- |
+| `Ctrl+K M`                                               | Change Language Mode (or Plain Text)                                      |
+| `Ctrl+/`                                                 | Toggle Line Comment (block comments per line in CSS, HTML, XML, Markdown) |
+| `Ctrl+K Ctrl+C`; `Ctrl+K Ctrl+U`                         | Add Line Comment (also to commented lines); Remove Line Comment           |
+| `Shift+Alt+A`                                            | Toggle Block Comment                                                      |
+| `Ctrl+Shift+\`                                           | Go to the matching bracket                                                |
+| `Shift+Alt+Right`; `Shift+Alt+Left`                      | Expand the selection to the enclosing syntax node; shrink it back         |
+| `Ctrl+Shift+O`                                           | Go to a symbol of the file                                                |
+| `(` `[` `{` `"` `'` (language-dependent)                 | Insert the closing character; with a selection, wrap it                   |
+| `Backspace` between an empty pair                        | Delete both characters                                                    |
+| `Enter` after `(`, `[`, `{` (and `:` in Python and YAML) | New line indented one level                                               |
+
+## Spelling
+
+With spelling on (`View: Toggle Spelling`, `spelling.enabled`):
+
+| Keys                       | Action                                                                 |
+| -------------------------- | ---------------------------------------------------------------------- |
+| `Ctrl+.`                   | Suggestions for the misspelled word, then Add to Dictionary and Ignore |
+| `Enter` (Spelling palette) | Replace the word with the selected suggestion (one undo step)          |
+| `F8`; `Shift+F8`           | Select the next; previous misspelled word (wraps)                      |

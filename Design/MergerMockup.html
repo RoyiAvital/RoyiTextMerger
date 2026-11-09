@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<!-- Mockup of Royi Text Merger (Architecture 001): the target window and the unsaved-changes hint. -->
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+@font-face { font-family: JBM; src: url("../assets/fonts/JetBrainsMono/JetBrainsMono-Regular.ttf"); }
+@font-face { font-family: JBM; font-weight: bold; src: url("../assets/fonts/JetBrainsMono/JetBrainsMono-Bold.ttf"); }
+html, body { margin: 0; background: #141517; }
+body { width: 1240px; padding: 22px 40px 30px; box-sizing: border-box; font-family: "Segoe UI", sans-serif; color: #C8CCD2; }
+h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; color: #E6E8EB; }
+h2 { font-size: 14px; font-weight: 600; margin: 26px 0 8px; color: #E6E8EB; }
+p.sub { margin: 0 0 14px; font-size: 13px; color: #8B9099; }
+.cap { font-size: 12.5px; color: #A0A4AB; margin: 8px 0 0; line-height: 1.45; }
+.cap b { color: #D4D4D4; font-weight: 600; }
+kbd { font-family: JBM, Consolas, monospace; font-size: 11.5px; background: #26282C; border: 1px solid #3E4148; border-radius: 3px; padding: 0 4px; color: #D4D4D4; }
+
+/* Window: title strip, two panes with a divider, overview ruler, status line. */
+.win, .mini { font-family: JBM, "Cascadia Mono", Consolas, monospace; font-size: 14px; font-variant-ligatures: none; font-feature-settings: "calt" 0, "liga" 0; background: #1E1F22; box-shadow: 0 8px 28px rgba(0,0,0,.55), 0 0 0 1px #2C2E33; }
+.cols { display: grid; grid-template-columns: 1fr 3ch 1fr 14px; }
+.cols.m1 { grid-template-columns: 1fr 6px 3ch 1fr 6px; }
+.title { height: 30px; line-height: 30px; background: #18191B; font-size: 13.5px; white-space: pre; overflow: hidden; }
+.hd { padding-left: 1ch; color: #80858F; overflow: hidden; }
+.hd.focus { color: #D4D4D4; }
+.hd .path { color: #6A6F78; }
+.hd.focus .path { color: #8B9099; }
+.dot { color: #4FA3E0; }
+.dot.refused { color: #E0A040; }
+.ro { color: #E0A040; font-size: 12px; }
+.app { color: #4FA3E0; font-weight: bold; }
+.bar { color: #5C6370; }
+.right-hd { display: flex; justify-content: space-between; padding-right: 1ch; }
+.status { height: 26px; line-height: 26px; background: #18191B; color: #8B9099; font-size: 13px; display: flex; justify-content: space-between; padding: 0 1ch; white-space: pre; }
+.status.prompt { background: #5A3E14; color: #F0E0C0; }
+
+.pane { padding: 4px 0; overflow: hidden; }
+.ln { display: flex; height: 20px; line-height: 20px; white-space: pre; color: #D4D4D4; }
+.ln .no { width: 4ch; text-align: right; color: #5C6370; padding-right: 0.5ch; flex: none; }
+.ln .ind { width: 2ch; color: #8B9099; flex: none; }
+.ln .tx { flex: 1; }
+.ln.cur .no { color: #A0A4AB; }
+.ln.del { background: #4B191B; }
+.ln.ins { background: #373E2C; }
+.ln.del .ind { color: #F48771; }
+.ln.ins .ind { color: #9CCC2C; }
+.ln.fill { background: repeating-linear-gradient(-45deg, #1E1F22 0 5px, #2C2E33 5px 6px); }
+.di { background: #6F1416; }
+.ii { background: #4B5A2C; }
+.caret { display: inline-block; width: 2px; height: 18px; background: #AEAFAD; vertical-align: -4px; margin-right: -2px; }
+.empty { height: 100%; display: flex; align-items: center; justify-content: center; color: #80858F; }
+
+.divider { background: #1B1C1F; box-shadow: inset 1px 0 #2C2E33, inset -1px 0 #2C2E33; padding: 4px 0; }
+.divider .ln { justify-content: center; color: #8B9099; }
+.divider .ln.arrows { color: #5FB3F0; }
+.ruler { position: relative; background: #1E1F22; box-shadow: inset 1px 0 #2C2E33; }
+.ruler .mk { position: absolute; width: 5px; }
+.ruler .mk.l { left: 2px; background: #C74E4E; }
+.ruler .mk.r { right: 2px; background: #8DB34A; }
+.ruler .slider { position: absolute; left: 0; right: 0; background: rgba(121,121,121,.4); }
+.strip { background: #1E1F22; position: relative; }
+.strip .slider { position: absolute; left: 0; right: 0; top: 4px; height: 70%; background: #434446; }
+
+/* Syntax colors of the dark theme. */
+.k { color: #569CD6; } .s { color: #CE9178; } .c { color: #6A9955; } .n { color: #B5CEA8; }
+.t { color: #4EC9B0; } .f { color: #DCDCAA; } .p { color: #A9AEB6; } .co { color: #4FC1FF; }
+
+.grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px 18px; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px 18px; }
+.tile { background: #18191B; box-shadow: 0 0 0 1px #2C2E33; padding: 12px 14px 12px; }
+.tile h3 { font-size: 13px; font-weight: 600; color: #E6E8EB; margin: 0 0 8px; }
+.tile.pick { box-shadow: 0 0 0 2px #4FA3E0; }
+.mini { box-shadow: 0 0 0 1px #2C2E33; font-size: 13px; }
+.mini .title { font-size: 12.5px; height: 26px; line-height: 26px; }
+.mini .ln { height: 19px; line-height: 19px; }
+.mini .status { font-size: 12px; height: 22px; line-height: 22px; }
+.wtitle { font-family: "Segoe UI", sans-serif; font-size: 12px; color: #A0A4AB; margin-top: 8px; }
+.wtitle span { background: #26282C; border: 1px solid #3E4148; padding: 1px 8px; border-radius: 3px; }
+.accent { box-shadow: inset 0 -2px #4FA3E0; }
+.accent.refused { box-shadow: inset 0 -2px #E0A040; }
+.tint { background: #1D2733; }
+.tint.refused { background: #2E2616; }
+</style>
+</head>
+<body>
+
+<h1>Royi Text Merger — mockup</h1>
+<p class="sub">Dark theme of Royi Text Editor. Target window of Architecture 001 (diff drawn from M3), merge mode, right pane focused with unsaved changes.</p>
+
+<div class="win">
+  <div class="title cols">
+    <div class="hd"><span class="path">C:\Work\Geometry\</span>area_v1.rs</div>
+    <div></div>
+    <div class="hd focus right-hd" style="grid-column: span 2"><span><span class="path">C:\Work\Geometry\</span>area_v2.rs  <span class="dot">●</span></span><span><span class="bar">│</span> <span class="app">Royi Text Merger</span></span></div>
+  </div>
+  <div class="cols" style="height: 388px">
+    <div class="pane">
+      <div class="ln"><span class="no">1</span><span class="ind"></span><span class="tx"><span class="k">use</span> std::f64::consts::<span class="co">PI</span>;</span></div>
+      <div class="ln"><span class="no">2</span><span class="ind"></span><span class="tx"></span></div>
+      <div class="ln del"><span class="no">3</span><span class="ind">-</span><span class="tx"><span class="c">/// Area of a <span class="di">square</span>.</span></span></div>
+      <div class="ln del"><span class="no">4</span><span class="ind">-</span><span class="tx"><span class="k">fn</span> <span class="f">area</span>(w: <span class="t">u32</span>) -&gt; <span class="t">u32</span> {</span></div>
+      <div class="ln del"><span class="no">5</span><span class="ind">-</span><span class="tx">    w * <span class="di">w</span></span></div>
+      <div class="ln"><span class="no">6</span><span class="ind"></span><span class="tx">}</span></div>
+      <div class="ln"><span class="no">7</span><span class="ind"></span><span class="tx"></span></div>
+      <div class="ln del"><span class="no">8</span><span class="ind">-</span><span class="tx"><span class="c">/// Kept for the old callers.</span></span></div>
+      <div class="ln del"><span class="no">9</span><span class="ind">-</span><span class="tx"><span class="k">fn</span> <span class="f">square</span>(w: <span class="t">u32</span>) -&gt; <span class="t">u32</span> { <span class="f">area</span>(w) }</span></div>
+      <div class="ln del"><span class="no">10</span><span class="ind">-</span><span class="tx"></span></div>
+      <div class="ln"><span class="no">11</span><span class="ind"></span><span class="tx"><span class="k">fn</span> <span class="f">circle</span>(r: <span class="t">f64</span>) -&gt; <span class="t">f64</span> {</span></div>
+      <div class="ln"><span class="no">12</span><span class="ind"></span><span class="tx">    <span class="co">PI</span> * r * r</span></div>
+      <div class="ln"><span class="no">13</span><span class="ind"></span><span class="tx">}</span></div>
+      <div class="ln"><span class="no">14</span><span class="ind"></span><span class="tx"></span></div>
+      <div class="ln"><span class="no">15</span><span class="ind"></span><span class="tx"><span class="k">fn</span> <span class="f">main</span>() {</span></div>
+      <div class="ln del"><span class="no">16</span><span class="ind">-</span><span class="tx">    <span class="f">println!</span>(<span class="s">"{}"</span>, <span class="f">area</span>(<span class="n">3</span>));</span></div>
+      <div class="ln fill"><span class="no"></span><span class="ind"></span><span class="tx"></span></div>
+      <div class="ln"><span class="no">17</span><span class="ind"></span><span class="tx">    <span class="f">println!</span>(<span class="s">"{:.2}"</span>, <span class="f">circle</span>(<span class="n">1.5</span>));</span></div>
+      <div class="ln"><span class="no">18</span><span class="ind"></span><span class="tx">}</span></div>
+    </div>
+    <div class="divider">
+      <div class="ln"> </div><div class="ln"> </div>
+      <div class="ln arrows">→ ←</div><div class="ln"> </div><div class="ln"> </div><div class="ln"> </div><div class="ln"> </div>
+      <div class="ln arrows">→ ←</div><div class="ln"> </div><div class="ln"> </div><div class="ln"> </div><div class="ln"> </div><div class="ln"> </div><div class="ln"> </div><div class="ln"> </div>
+      <div class="ln arrows">→ ←</div><div class="ln arrows">→ ←</div><div class="ln"> </div><div class="ln"> </div>
+    </div>
+    <div class="pane">
+      <div class="ln"><span class="no">1</span><span class="ind"></span><span class="tx"><span class="k">use</span> std::f64::consts::<span class="co">PI</span>;</span></div>
+      <div class="ln"><span class="no">2</span><span class="ind"></span><span class="tx"></span></div>
+      <div class="ln ins"><span class="no">3</span><span class="ind">+</span><span class="tx"><span class="c">/// Area of a <span class="ii">rectangle</span>.</span></span></div>
+      <div class="ln ins"><span class="no">4</span><span class="ind">+</span><span class="tx"><span class="k">fn</span> <span class="f">area</span>(w: <span class="t">u32</span><span class="ii">, h: <span class="t">u32</span></span>) -&gt; <span class="t">u32</span> {</span></div>
+      <div class="ln ins"><span class="no">5</span><span class="ind">+</span><span class="tx">    w * <span class="ii">h</span></span></div>
+      <div class="ln"><span class="no">6</span><span class="ind"></span><span class="tx">}</span></div>
+      <div class="ln"><span class="no">7</span><span class="ind"></span><span class="tx"></span></div>
+      <div class="ln fill"><span class="no"></span><span class="ind"></span><span class="tx"></span></div>
+      <div class="ln fill"><span class="no"></span><span class="ind"></span><span class="tx"></span></div>
+      <div class="ln fill"><span class="no"></span><span class="ind"></span><span class="tx"></span></div>
+      <div class="ln"><span class="no">8</span><span class="ind"></span><span class="tx"><span class="k">fn</span> <span class="f">circle</span>(r: <span class="t">f64</span>) -&gt; <span class="t">f64</span> {</span></div>
+      <div class="ln"><span class="no">9</span><span class="ind"></span><span class="tx">    <span class="co">PI</span> * r * r</span></div>
+      <div class="ln"><span class="no">10</span><span class="ind"></span><span class="tx">}</span></div>
+      <div class="ln"><span class="no">11</span><span class="ind"></span><span class="tx"></span></div>
+      <div class="ln"><span class="no">12</span><span class="ind"></span><span class="tx"><span class="k">fn</span> <span class="f">main</span>() {</span></div>
+      <div class="ln ins"><span class="no">13</span><span class="ind">+</span><span class="tx">    <span class="f">println!</span>(<span class="s">"{}"</span>, <span class="f">area</span>(<span class="n">3</span><span class="ii">, <span class="n">4</span></span>));</span></div>
+      <div class="ln ins cur"><span class="no">14</span><span class="ind">+</span><span class="tx">    <span class="c">// Circles are next.</span><span class="caret"></span></span></div>
+      <div class="ln"><span class="no">15</span><span class="ind"></span><span class="tx">    <span class="f">println!</span>(<span class="s">"{:.2}"</span>, <span class="f">circle</span>(<span class="n">1.5</span>));</span></div>
+      <div class="ln"><span class="no">16</span><span class="ind"></span><span class="tx">}</span></div>
+    </div>
+    <div class="ruler">
+      <div class="slider" style="top: 4px; height: 380px"></div>
+      <div class="mk l" style="top: 44px; height: 60px"></div><div class="mk r" style="top: 44px; height: 60px"></div>
+      <div class="mk l" style="top: 144px; height: 60px"></div>
+      <div class="mk l" style="top: 304px; height: 20px"></div><div class="mk r" style="top: 304px; height: 40px"></div>
+    </div>
+  </div>
+  <div class="status"><span>4 changes</span><span>Right  ·  Ln 14, Col 25  ·  UTF-8  ·  LF  ·  Rust</span></div>
+</div>
+<p class="cap"><b>Title strip:</b> one header per pane: folder dim, file name, the unsaved <span class="dot">●</span>; the focused pane's header is bright. <b>Divider:</b> <span style="color:#5FB3F0">→ ←</span> copy a change (<kbd>Alt+Right</kbd> / <kbd>Alt+Left</kbd>). <b>Overview ruler:</b> left changes red, right changes green, under the slider. <b>Rows:</b> removed lines red, inserted green, changed characters stronger, hatched filler rows keep the panes aligned. <b>Status line:</b> diff state; the focused pane's side and position.</p>
+
+<h2>Unsaved changes: the hint per pane (Royi Text Editor: <span class="dot">●</span> after the title; orange after a refused save)</h2>
+<div class="grid">
+  <div class="tile pick">
+    <h3>A. Editor parity (proposed)</h3>
+    <div class="mini">
+      <div class="title cols"><div class="hd">area_v1.rs</div><div></div><div class="hd focus" style="grid-column: span 2">area_v2.rs  <span class="dot">●</span></div></div>
+      <div class="cols"><div class="pane"><div class="ln"><span class="no">13</span><span class="ind"></span><span class="tx">}</span></div></div><div class="divider"><div class="ln"> </div></div><div class="pane"><div class="ln"><span class="no">10</span><span class="ind"></span><span class="tx">}<span class="caret"></span></span></div></div><div></div></div>
+    </div>
+    <div class="mini" style="margin-top: 8px">
+      <div class="title cols"><div class="hd focus">area_v1.rs  <span class="dot refused">●</span></div><div></div><div class="hd" style="grid-column: span 2">area_v2.rs  <span class="dot">●</span></div></div>
+    </div>
+    <p class="cap">The Editor's <span class="dot">●</span> after each dirty pane's name; <span class="dot refused">●</span> orange after a save refused by the Read-only attribute. Nothing else changes.</p>
+  </div>
+  <div class="tile">
+    <h3>B. A + accent line</h3>
+    <div class="mini">
+      <div class="title cols"><div class="hd">area_v1.rs</div><div></div><div class="hd focus accent" style="grid-column: span 2">area_v2.rs  <span class="dot">●</span></div></div>
+      <div class="cols"><div class="pane"><div class="ln"><span class="no">13</span><span class="ind"></span><span class="tx">}</span></div></div><div class="divider"><div class="ln"> </div></div><div class="pane"><div class="ln"><span class="no">10</span><span class="ind"></span><span class="tx">}<span class="caret"></span></span></div></div><div></div></div>
+    </div>
+    <div class="mini" style="margin-top: 8px">
+      <div class="title cols"><div class="hd focus accent refused">area_v1.rs  <span class="dot refused">●</span></div><div></div><div class="hd accent" style="grid-column: span 2">area_v2.rs  <span class="dot">●</span></div></div>
+    </div>
+    <p class="cap">Also a 2 px line under the dirty pane's header, in the marker's color: visible from a distance, without reading the names.</p>
+  </div>
+  <div class="tile">
+    <h3>C. A + tinted header</h3>
+    <div class="mini">
+      <div class="title cols"><div class="hd">area_v1.rs</div><div></div><div class="hd focus tint" style="grid-column: span 2">area_v2.rs  <span class="dot">●</span></div></div>
+      <div class="cols"><div class="pane"><div class="ln"><span class="no">13</span><span class="ind"></span><span class="tx">}</span></div></div><div class="divider"><div class="ln"> </div></div><div class="pane"><div class="ln"><span class="no">10</span><span class="ind"></span><span class="tx">}<span class="caret"></span></span></div></div><div></div></div>
+    </div>
+    <div class="mini" style="margin-top: 8px">
+      <div class="title cols"><div class="hd focus tint refused">area_v1.rs  <span class="dot refused">●</span></div><div></div><div class="hd tint" style="grid-column: span 2">area_v2.rs  <span class="dot">●</span></div></div>
+    </div>
+    <p class="cap">Also the dirty pane's header background takes a tint of the marker's color.</p>
+  </div>
+</div>
+<p class="cap">In all three the window title (taskbar) is marked as the Editor's: <span class="wtitle"><span>● area_v1.rs ↔ area_v2.rs - Royi Text Merger</span></span></p>
+
+<h2>Other states</h2>
+<div class="grid2">
+  <div class="tile">
+    <h3>M1 as built next: two panes, no diff yet</h3>
+    <div class="mini">
+      <div class="title cols m1"><div class="hd" style="grid-column: span 2">area_v1.rs</div><div></div><div class="hd focus right-hd" style="grid-column: span 2"><span>area_v2.rs  <span class="dot">●</span></span><span class="app">Royi Text Merger</span></div></div>
+      <div class="cols m1" style="height: 58px">
+        <div class="pane"><div class="ln"><span class="no">3</span><span class="ind"></span><span class="tx"><span class="c">/// Area of a square.</span></span></div><div class="ln"><span class="no">4</span><span class="ind"></span><span class="tx"><span class="k">fn</span> <span class="f">area</span>(w: <span class="t">u32</span>)</span></div></div>
+        <div class="strip"><div class="slider"></div></div>
+        <div class="divider"><div class="ln"> </div></div>
+        <div class="pane"><div class="ln"><span class="no">3</span><span class="ind"></span><span class="tx"><span class="c">/// Area of a rectangle.</span></span></div><div class="ln"><span class="no">4</span><span class="ind"></span><span class="tx"><span class="k">fn</span> <span class="f">area</span>(w: <span class="t">u32</span>,<span class="caret"></span></span></div></div>
+        <div class="strip"><div class="slider"></div></div>
+      </div>
+      <div class="status"><span>16 lines</span><span>Right  ·  Ln 4, Col 21  ·  UTF-8  ·  LF  ·  Rust</span></div>
+    </div>
+    <p class="cap">Each pane keeps the Editor's scroll strip and scrolls on its own; M3 replaces both strips with the overview ruler and one shared scroll.</p>
+  </div>
+  <div class="tile">
+    <h3>Empty pane (one path, or after <kbd>Ctrl+W</kbd>)</h3>
+    <div class="mini">
+      <div class="title cols"><div class="hd focus">area_v1.rs</div><div></div><div class="hd" style="grid-column: span 2"></div></div>
+      <div class="cols" style="height: 58px">
+        <div class="pane"><div class="ln"><span class="no">1</span><span class="ind"></span><span class="tx"><span class="k">use</span> std::f64::consts::<span class="co">PI</span>;<span class="caret"></span></span></div><div class="ln"><span class="no">2</span><span class="ind"></span><span class="tx"></span></div></div>
+        <div class="divider"><div class="ln"> </div></div>
+        <div class="pane"><div class="empty">Drop a file here to open it</div></div>
+        <div></div>
+      </div>
+      <div class="status"><span>18 lines</span><span>Left  ·  Ln 1, Col 26  ·  UTF-8  ·  LF  ·  Rust</span></div>
+    </div>
+    <p class="cap">A dropped file opens in the pane under the pointer; two dropped files open as left and right.</p>
+  </div>
+  <div class="tile">
+    <h3>Closing with two dirty files</h3>
+    <div class="mini">
+      <div class="title cols"><div class="hd">area_v1.rs  <span class="dot">●</span></div><div></div><div class="hd focus" style="grid-column: span 2">area_v2.rs  <span class="dot">●</span></div></div>
+      <div class="status prompt"><span>Save changes to area_v1.rs and area_v2.rs?   Enter: Save   D: Discard   Esc: Cancel</span><span></span></div>
+    </div>
+    <p class="cap">One question for every dirty pane; <kbd>Enter</kbd> saves them one after the other.</p>
+  </div>
+  <div class="tile">
+    <h3>Diff mode (<kbd>--diff-mode</kbd>)</h3>
+    <div class="mini">
+      <div class="title cols"><div class="hd">area_v1.rs  <span class="ro">RO</span></div><div></div><div class="hd focus" style="grid-column: span 2">area_v2.rs  <span class="ro">RO</span></div></div>
+      <div class="status"><span>4 changes  ·  Diff mode</span><span>Right  ·  Ln 14, Col 5</span></div>
+    </div>
+    <p class="cap">Both panes read-only; no copy arrows in the divider. <kbd>--read-only</kbd> marks only the left header.</p>
+  </div>
+</div>
+
+</body>
+</html>
