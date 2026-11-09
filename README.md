@@ -6,7 +6,7 @@
 `RoyiTextMerger` is a portable, keyboard workflow focused, lightweight and
 performance oriented Diff & Merge tool.
 
-> ![IMPORTANT]
+> [!IMPORTANT]
 > The main use case is comparing and merging two text files initiated by a _File Manager_ or command line.
 
 It focuses on:
