@@ -69,6 +69,7 @@ impl Editor {
         self.pane.disk = None;
         self.pane.deletion_shown = false;
         self.pane.restore = None;
+        self.pane.widest = 0;
     }
 
     /// Why the current file may not be replaced by `dropped` now.

@@ -876,6 +876,7 @@ mod tests {
                     highlights: Default::default(),
                     empty: None,
                     slider_active: false,
+                    measure: false,
                 },
                 &mut list,
             );

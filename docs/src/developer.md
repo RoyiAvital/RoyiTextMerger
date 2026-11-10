@@ -85,8 +85,8 @@ The design, the review history and the decisions are in
 
 The repository targets Windows x64 with the GNU Rust toolchain and
 `x86-64-v3` CPU features. `windres` is required to embed the application
-manifest and icon. Missing font assets are fetched from pinned releases and
-SHA-256 verified by the `rtm_assets` build script.
+manifest, icon and version information. Missing font assets are fetched from
+pinned releases and SHA-256 verified by the `rtm_assets` build script.
 
 Run focused tests for the crate being changed. Do not run the whole workspace
 suite or performance suite unless requested; see

@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-11
+
+This version polishes the scroll bar experience.
+
+### Added
+
+- A horizontal slider over the bottom of each pane once its file is loaded
+  and a row wider than the view is drawn in either pane: drag it, or press
+  its track to jump there (the caret and the focus stay). Both panes scroll
+  together. It spans the widest row drawn since the files were opened, as in
+  VS Code; rows going past the view are bounded without laying them out, so
+  dragging always reaches their end.
+- The executable carries version information from `Meta/AppMeta.json`, shown
+  in its Properties (Details): File Version, Product Version, Product Name,
+  File Description and Original Filename.
+
+### Fixed
+
+- The scroll slider can be dragged when the window is not maximized: the
+  resize border at the right edge took the mouse. Beside the slider, the
+  right edge resizes over the title strip and the status line; the corners
+  resize as before.
+
+### Documentation
+
+- Keyboard Shortcuts: the horizontal slider and resizing at the right edge.
+
 ## [0.1.0]
 
 The first release: a Diff & Merge tool for a pair of text and code files, built

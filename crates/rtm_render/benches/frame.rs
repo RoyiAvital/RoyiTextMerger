@@ -93,6 +93,7 @@ fn frames(bencher: Bencher, snapshot: &Snapshot, width: u32, height: u32, px: f3
             highlights: Default::default(),
             empty: None,
             slider_active: false,
+            measure: true,
         };
         view.build(&frame, &mut list);
         renderer.draw(
@@ -233,6 +234,7 @@ fn two_panes(bencher: Bencher, (width, height, px): (u32, u32, f32)) {
                 highlights: Default::default(),
                 empty: None,
                 slider_active: false,
+                measure: true,
             };
             view.build_pane(&frame, &mut list);
         }

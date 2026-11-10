@@ -54,6 +54,8 @@ key; run them from the Command Palette. See
 | Wheel; `Ctrl+Up` / `Ctrl+Down`                                                  | Scroll vertically                                                        |
 | `Alt+PgUp` / `Alt+PgDn`                                                         | Scroll a page; the caret stays                                           |
 | Drag the slider; press the strip at the right edge                              | Scroll; jump to that place                                               |
+| Drag a pane's bottom slider; press its track                                    | Scroll both panes horizontally; jump to that place                       |
+| Drag a corner; the right edge over the title strip or the status line           | Resize the window (beside the slider, the right edge scrolls)            |
 | `Shift`+wheel                                                                   | Scroll horizontally                                                      |
 | `Ctrl+=` / `Ctrl+Shift+=` / `Ctrl+Numpad+`; `Ctrl+-` / `Ctrl+Numpad-`; `Ctrl+0` | Zoom in; zoom out; reset zoom                                            |
 | `Ctrl`+wheel                                                                    | Zoom in or out                                                           |
@@ -61,6 +63,7 @@ key; run them from the Command Palette. See
 | `Ctrl+K Ctrl+S`                                                                 | Show the keyboard shortcuts                                              |
 
 Mouse clicks place the caret and focus their pane. `Shift`+click extends the current selection.
+The scroll bars scroll both panes and keep the focus.
 Commands without a shortcut are available by name in the Command Palette, for
 example `File: Copy File Name`, which copies the file name.
 

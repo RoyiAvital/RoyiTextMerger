@@ -717,7 +717,7 @@ checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
 
 [[package]]
 name = "rtm_app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "resvg",
  "rtm_assets",
@@ -738,11 +738,11 @@ dependencies = [
 
 [[package]]
 name = "rtm_assets"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "rtm_diff"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "divan",
  "imara-diff",
@@ -754,7 +754,7 @@ dependencies = [
 
 [[package]]
 name = "rtm_edit"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "divan",
  "proptest",
@@ -764,14 +764,14 @@ dependencies = [
 
 [[package]]
 name = "rtm_platform"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "windows-sys",
 ]
 
 [[package]]
 name = "rtm_render"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "divan",
  "rtm_assets",
@@ -783,7 +783,7 @@ dependencies = [
 
 [[package]]
 name = "rtm_search"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "fancy-regex",
  "memchr",
@@ -795,14 +795,14 @@ dependencies = [
 
 [[package]]
 name = "rtm_spell"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "spellbook",
 ]
 
 [[package]]
 name = "rtm_syntax"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libmimalloc-sys",
  "rtm_text",
@@ -836,7 +836,7 @@ dependencies = [
 
 [[package]]
 name = "rtm_text"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "divan",
  "memchr",
@@ -846,7 +846,7 @@ dependencies = [
 
 [[package]]
 name = "rtm_view"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rtm_edit",
  "rtm_text",
@@ -1489,7 +1489,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rtm_syntax",
  "serde_json",

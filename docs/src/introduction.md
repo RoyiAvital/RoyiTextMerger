@@ -56,7 +56,8 @@ it.
   changes and `RO` when it is read-only. The focused pane's header is bright.
 - **Panes:** the left and the right file, scrolling together. Unchanged
   lines face each other; a change takes the rows of its longer side, and the
-  other side shows hatched filler rows.
+  other side shows hatched filler rows. A line wider than the view adds a
+  horizontal slider at the bottom of each pane.
 - **Divider:** `→` and `←` on the first row of each change copy it to the
   right or to the left with a click.
 - **Overview ruler:** the changes of the whole comparison at the right edge,

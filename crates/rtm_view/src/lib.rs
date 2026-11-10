@@ -408,6 +408,45 @@ pub fn page_rows(layout: &Layout, cell: Cell) -> u64 {
     u64::from((layout.text.h / cell.height.max(1)).max(1))
 }
 
+/// Track of the horizontal slider: the bottom of the text area, `thickness`
+/// pixels high (the vertical strip's width; `None` for 0).
+pub fn htrack(layout: &Layout, thickness: u32) -> Option<Rect> {
+    let text = layout.text;
+    let h = thickness.min(text.h);
+    (h > 0 && text.w > 0).then(|| Rect {
+        x: text.x,
+        y: text.y + (text.h - h) as i32,
+        w: text.w,
+        h,
+    })
+}
+
+/// The horizontal slider in [`htrack`] for rows `total` columns wide, a view
+/// from `first_col` showing `layout.cols` columns, at least `min` pixels
+/// wide. `None` when the rows fit.
+pub fn hslider(
+    layout: &Layout,
+    thickness: u32,
+    total: u64,
+    first_col: u64,
+    min: u32,
+) -> Option<Rect> {
+    let track = htrack(layout, thickness)?;
+    let cols = u64::from(layout.cols);
+    if total <= cols {
+        return None;
+    }
+    let w = u64::from(track.w);
+    let size = (w * cols / total).max(u64::from(min)).min(w);
+    let last = total - cols;
+    let x = (w - size) * first_col.min(last) / last;
+    Some(Rect {
+        x: track.x + x as i32,
+        w: size as u32,
+        ..track
+    })
+}
+
 /// First visible row and column of the text area. Both panes share it: a
 /// row shows a line or a filler of each pane.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -565,6 +604,9 @@ pub struct DisplayList {
     pub popup: Layer,
     /// Drawn last: tooltips.
     pub tooltip: Layer,
+    /// Columns of the widest drawn row when [`Frame::measure`]; rows going
+    /// past the view count at most (see [`max_cols`]).
+    pub widest: u64,
 }
 
 impl DisplayList {
@@ -576,6 +618,7 @@ impl DisplayList {
         self.overlays.clear();
         self.popup.clear();
         self.tooltip.clear();
+        self.widest = 0;
     }
 }
 
@@ -613,6 +656,8 @@ pub struct Frame<'a> {
     pub empty: Option<&'a str>,
     /// The scroll slider is being dragged.
     pub slider_active: bool,
+    /// Report the widest drawn row in [`DisplayList::widest`].
+    pub measure: bool,
 }
 
 /// Search decorations and syntax colors of a frame.
@@ -769,6 +814,7 @@ impl ViewBuilder {
             highlights: _,
             empty,
             slider_active,
+            measure,
         } = *frame;
         let fill = |out: &mut DisplayList, rect: Rect, color| out.fills.push(Fill { rect, color });
         fill(out, layout.gutter, theme.background);
@@ -1029,6 +1075,20 @@ impl ViewBuilder {
                         );
                     }
                 }
+            }
+            // Past the scan end each byte is a column (the long-line rule).
+            if measure {
+                let beyond = if long {
+                    content_end - range.start - seam as u64
+                } else {
+                    0
+                };
+                let width = match reached {
+                    Some(end) => end.col + beyond,
+                    None => (max_cols(&bytes[..seam], options.tab_width) + beyond)
+                        .max(scroll.first_col + u64::from(cols)),
+                };
+                out.widest = out.widest.max(width);
             }
             if caret != CaretStyle::Hidden {
                 caret_row(out, frame, row_rect, bytes, content);
@@ -1531,6 +1591,26 @@ fn text_run_bold(
     cols
 }
 
+/// Columns `bytes` take at most, without laying them out: two for a
+/// character of three or four bytes, one for other characters and invalid
+/// bytes, a full tab stop for a tab. Exact for ASCII without tabs inside the
+/// line, for most scripts and for wide CJK.
+fn max_cols(bytes: &[u8], tab_width: u32) -> u64 {
+    let tab = tab_width.max(1) as u64 - 1;
+    let mut cols = 0;
+    for chunk in bytes.utf8_chunks() {
+        cols += chunk
+            .valid()
+            .bytes()
+            .map(|b| {
+                u64::from((b as i8) >= -0x40) + u64::from(b >= 0xE0) + u64::from(b == b'\t') * tab
+            })
+            .sum::<u64>();
+        cols += chunk.invalid().len() as u64;
+    }
+    cols
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Text,
@@ -1986,6 +2066,7 @@ mod tests {
                 highlights,
                 empty: None,
                 slider_active: false,
+                measure: true,
             },
             &mut list,
         );
@@ -2100,6 +2181,7 @@ mod tests {
                     highlights: Highlights::default(),
                     empty: Some("Drop a file"),
                     slider_active: false,
+                    measure: true,
                 },
                 &mut list,
             );
@@ -2222,11 +2304,93 @@ mod tests {
                     highlights: Highlights::default(),
                     empty: None,
                     slider_active: active,
+                    measure: false,
                 },
                 &mut list,
             );
             assert!(list.fills.contains(&Fill { rect: top, color }));
         }
+    }
+
+    #[test]
+    fn the_horizontal_slider_follows_the_view() {
+        let cell = Cell {
+            width: 10,
+            height: 20,
+        };
+        let options = Options {
+            scroll_strip: 6,
+            ..Options::default()
+        };
+        let layout = Layout::new(400, 300, cell, 10, &options);
+        let track = htrack(&layout, 6).unwrap();
+        let text = layout.text;
+        assert_eq!((track.x, track.w, track.h), (text.x, text.w, 6));
+        assert_eq!(
+            track.y + 6,
+            text.y + text.h as i32,
+            "over the text's bottom"
+        );
+        let cols = u64::from(layout.cols);
+        assert_eq!(hslider(&layout, 6, cols, 0, 20), None, "the rows fit");
+        let left = hslider(&layout, 6, 2 * cols, 0, 20).unwrap();
+        assert_eq!(
+            left,
+            Rect {
+                w: track.w / 2,
+                ..track
+            }
+        );
+        let right = hslider(&layout, 6, 2 * cols, cols, 20).unwrap();
+        assert_eq!(right.x + right.w as i32, track.x + track.w as i32);
+        let middle = hslider(&layout, 6, 2 * cols, cols / 2, 20).unwrap();
+        assert!(left.x < middle.x && middle.x < right.x);
+        let huge = hslider(&layout, 6, 10_000_000, 0, 20).unwrap();
+        assert_eq!(huge.w, 20, "minimum width");
+        // A pane without the vertical strip has a track of the same height.
+        let plain = Layout::new(400, 300, cell, 10, &Options::default());
+        assert_eq!(htrack(&plain, 6).map(|t| t.h), Some(6));
+        assert_eq!(htrack(&plain, 0), None, "no thickness");
+    }
+
+    /// Rows ending in the view report their exact width; wider ones a bound
+    /// at least their width, so scrolling reaches their end; a long line
+    /// counts a column per byte past its scan end.
+    #[test]
+    fn the_widest_drawn_row_is_reported() {
+        let widest = |bytes: &[u8], first_col: u64| {
+            let scroll = Scroll {
+                first_col,
+                ..Scroll::default()
+            };
+            let highlights = Highlights::default();
+            let (_, list) = build_at(bytes, 400, 200, scroll, &[], CaretStyle::Hidden, highlights);
+            list.widest
+        };
+        assert_eq!(widest(b"ab\n\tc\nxyz", 0), 5, "a tab stop");
+        assert_eq!(
+            widest("\u{e9}\u{6f22}".as_bytes(), 0),
+            3,
+            "a wide character"
+        );
+        let wide = "x".repeat(100) + "\n" + &"\u{e9}".repeat(90);
+        assert_eq!(widest(wide.as_bytes(), 0), 100, "estimated past the view");
+        assert_eq!(
+            widest(wide.as_bytes(), 80),
+            100,
+            "exact once its end is drawn"
+        );
+        let tabs = "\tx".repeat(50);
+        assert_eq!(widest(tabs.as_bytes(), 200), 201, "exact");
+        assert!(widest(tabs.as_bytes(), 0) >= 201, "a bound past the view");
+        let cjk = "\u{6f22}".repeat(500);
+        assert_eq!(widest(cjk.as_bytes(), 0), 1000, "two columns each");
+        assert_eq!(widest(&[0x80; 100], 0), 100, "invalid bytes");
+        let long = "x".repeat(ROW_SCAN_LIMIT + 100);
+        let end = (ROW_SCAN_LIMIT + 100) as u64;
+        assert_eq!(widest(long.as_bytes(), 0), end);
+        assert_eq!(widest(long.as_bytes(), end - 20), end);
+        assert_eq!(widest(b"", 0), 0);
     }
 
     #[test]
@@ -2587,6 +2751,7 @@ mod tests {
                 highlights: Highlights::default(),
                 empty: None,
                 slider_active: false,
+                measure: false,
             },
             &mut list,
         );
@@ -2669,6 +2834,7 @@ mod tests {
                 highlights: Highlights::default(),
                 empty: None,
                 slider_active: false,
+                measure: false,
             },
             &mut list,
         );
@@ -2728,6 +2894,7 @@ mod tests {
                     highlights: Highlights::default(),
                     empty: None,
                     slider_active: false,
+                    measure: false,
                 },
                 &mut list,
             );
@@ -2846,6 +3013,7 @@ mod tests {
                 highlights: Highlights::default(),
                 empty: None,
                 slider_active: false,
+                measure: false,
             },
             &mut list,
         );
