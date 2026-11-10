@@ -4,6 +4,8 @@
 
 ## Changes
 
+- [ ] Add horizontal scrol bar in case of long lines (Defer after loading).
+
 ## Bugs
 
 ## Performance
