@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-15
+
+### Fixed
+
+- Moving the pointer onto the scroll sliders no longer shows the resize
+  arrow: the right and the bottom edges no longer resize the window. Every
+  corner resizes it both ways; the left and the top edges as before.
+
+### Documentation
+
+- Keyboard Shortcuts: the window resizes from its corners and its left and
+  top edges.
+
 ## [0.1.1] - 2026-11-11
 
 This version polishes the scroll bar experience.

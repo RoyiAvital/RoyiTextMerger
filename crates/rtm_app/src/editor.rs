@@ -1219,6 +1219,12 @@ impl Editor {
         self.scroll.first_col = ((left * last + travel / 2) / travel) as u64;
     }
 
+    /// The point is on the vertical strip or a shown horizontal slider's
+    /// track (an arrow pointer, not the text one; the focus stays).
+    fn is_scroll_bar(&self, x: i32, y: i32) -> bool {
+        self.strip().is_some_and(|track| track.contains(x, y)) || self.htrack_side(x, y).is_some()
+    }
+
     fn toggle_full_screen(&mut self, ctx: &mut Ctx) {
         ctx.set_full_screen(!self.full_screen);
     }
@@ -3386,10 +3392,6 @@ impl App for Editor {
                 && self
                     .find_geometry()
                     .is_some_and(|g| g.panel.contains(x, y) || g.message.contains(x, y)))
-    }
-
-    fn is_scroll_bar(&self, x: i32, y: i32) -> bool {
-        self.strip().is_some_and(|track| track.contains(x, y)) || self.htrack_side(x, y).is_some()
     }
 }
 
@@ -6533,8 +6535,7 @@ mod tests {
 
     /// A drawn row wider than the view shows a slider over the bottom of the
     /// text; dragging it scrolls without moving the caret, up to the end of
-    /// a row of wide characters. Both scroll bars take the mouse inside the
-    /// window's resize border.
+    /// a row of wide characters. Both scroll bars show the arrow pointer.
     #[test]
     fn the_horizontal_slider_drags_without_moving_the_caret() {
         let files = Arc::new(FakeFiles::default());
