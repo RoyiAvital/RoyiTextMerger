@@ -3026,7 +3026,8 @@ impl Editor {
         // Row widths are measured once the file is loaded.
         let measure = !matches!(self.pane.status, LoadStatus::Loading { .. });
         if layout.scrollbar.w > 0 {
-            self.refresh_marks(layout.scrollbar.h);
+            let page = rtm_view::page_rows(&layout, cell);
+            self.refresh_marks(layout.scrollbar.h, page, cell.height);
         }
         let brackets: Vec<u64> = self
             .bracket_pair()
@@ -7783,6 +7784,62 @@ mod tests {
         assert_eq!(sides, [Side::Left, Side::Right]);
     }
 
+    /// The overview ruler shares the slider's scale: the changes the view
+    /// shows are marked within the slider, also in a text shorter than it.
+    #[test]
+    fn the_overview_ruler_marks_the_changes_in_view_within_the_slider() {
+        let files = Arc::new(FakeFiles::default());
+        let side = |tag: &str| -> String {
+            (0..200)
+                .map(|i| match i % 10 < 3 {
+                    true => format!("{tag}{i}\n"),
+                    false => format!("same {i}\n"),
+                })
+                .collect()
+        };
+        let long = (side("L"), side("R"));
+        let short = ("a\nb\nc".to_owned(), "a\nb\nc\n".to_owned());
+        for (left, right) in [long, short] {
+            let mut editor = pair_on(&files, left.as_bytes(), right.as_bytes(), false);
+            let mut ctx = Ctx::headless(800, 600, 96);
+            editor.event(Event::Wake, &mut ctx);
+            compared(&mut editor, &mut ctx);
+            let mut pixels = vec![0; 800 * 600];
+            editor.paint(&mut pixels, 800, 600);
+            let a = editor.compare.alignment().clone();
+            // Every change has right lines and its own mark there.
+            let marks: Vec<rtm_view::Mark> = editor
+                .compare
+                .marks()
+                .iter()
+                .filter(|m| m.side == Side::Right)
+                .copied()
+                .collect();
+            assert_eq!(marks.len(), a.hunks().len());
+            let strip = editor.strip().unwrap();
+            let page = rtm_view::page_rows(&editor.layout_of(Side::Right), editor.renderer.cell());
+            let mut checked = 0;
+            for top in 0..a.rows() {
+                editor.scroll.top_row = top;
+                let slider = editor.slider().unwrap();
+                let inside = (slider.y - strip.y) as u32..(slider.y - strip.y) as u32 + slider.h;
+                for (i, mark) in marks.iter().enumerate() {
+                    let rows = a.hunk_rows(i);
+                    if rows.start < top || rows.end > top + page {
+                        continue;
+                    }
+                    checked += 1;
+                    // A mark is at least 2 px high: it may pass the slider by one.
+                    assert!(
+                        inside.contains(&mark.top) && mark.top + mark.height <= inside.end + 1,
+                        "top {top}, change {i} rows {rows:?}: mark {mark:?}, slider {inside:?}"
+                    );
+                }
+            }
+            assert!(checked > 0);
+        }
+    }
+
     #[test]
     fn the_panes_scroll_together_over_the_rows() {
         let files = Arc::new(FakeFiles::default());
@@ -8325,6 +8382,28 @@ mod tests {
         assert_eq!(side_text(&editor, Side::Left), "a\nX\nc\n");
         assert_eq!(compared(&mut editor, &mut ctx), "Identical");
         assert!(editor.arrows().is_empty());
+    }
+
+    /// A change scrolled past its first row keeps its arrows on its first
+    /// visible row, and they copy it.
+    #[test]
+    fn divider_arrows_stay_on_a_change_scrolled_past_its_start() {
+        let files = Arc::new(FakeFiles::default());
+        let old: String = (0..80).map(|i| format!("old {i}\n")).collect();
+        let new: String = (0..50).map(|i| format!("new {i}\n")).collect();
+        let (left, right) = (format!("a\n{old}z\n"), format!("a\n{new}z\n"));
+        let mut editor = pair_on(&files, left.as_bytes(), right.as_bytes(), false);
+        let mut ctx = Ctx::headless(800, 600, 96);
+        editor.event(Event::Wake, &mut ctx);
+        compared(&mut editor, &mut ctx);
+        editor.scroll.top_row = 20;
+        let rows: Vec<u32> = editor.arrows().iter().map(|a| a.row).collect();
+        assert_eq!(rows, [0]);
+        let layout = editor.layout();
+        let h = editor.renderer.cell().height as i32;
+        editor.event(click(layout.divider.x + 2, layout.text.y + h / 2), &mut ctx);
+        editor.event(Event::MouseUp, &mut ctx);
+        assert_eq!(side_text(&editor, Side::Right), left);
     }
 
     #[test]

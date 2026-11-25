@@ -440,8 +440,7 @@ impl Editor {
         let end = top + u64::from(self.layout().rows);
         alignment
             .hunks_in(top..end)
-            .map(|i| alignment.hunk_rows(i).start)
-            .filter(|&start| start >= top)
+            .map(|i| alignment.hunk_rows(i).start.max(top))
             .map(|start| Arrows {
                 row: (start - top) as u32,
                 right,

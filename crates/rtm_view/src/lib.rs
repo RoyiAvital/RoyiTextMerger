@@ -192,8 +192,9 @@ impl Side {
 /// Width of the divider between two panes, in cells: `→`, a space, `←`.
 pub const DIVIDER_CELLS: u32 = 3;
 
-/// The divider's copy arrows on the first row of a change: `row` counts the
-/// visible rows; `right` copies it to the right pane, `left` to the left.
+/// The divider's copy arrows on the first visible row of a change: `row`
+/// counts the visible rows; `right` copies it to the right pane, `left` to
+/// the left.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Arrows {
     pub row: u32,
@@ -391,16 +392,37 @@ pub fn slider(layout: &Layout, rows: u64, top_row: u64, page: u64, min: u32) -> 
     }
     let last = rows - 1;
     let h = u64::from(track.h);
-    let size = (h * page / (last + page)).max(u64::from(min)).min(h);
-    let y = ((h - size) * top_row.min(last))
-        .checked_div(last)
-        .unwrap_or(0);
+    let size = slider_size(h, last, page, min);
+    let y = track_y(track.h, rows, page, min, top_row.min(last));
     Some(Rect {
         x: track.x,
         y: track.y + y as i32,
         w: track.w,
         h: size as u32,
     })
+}
+
+/// Height of the slider in a track `h` pixels high: the view's share of the
+/// rows up to the last one at the top, at least `min` pixels. Rounded up,
+/// so the rows of the view map within it ([`track_y`]).
+fn slider_size(h: u64, last: u64, page: u64, min: u32) -> u64 {
+    (h * page)
+        .div_ceil((last + page).max(1))
+        .max(u64::from(min))
+        .min(h)
+}
+
+/// Pixel offset of `row` in a scroll track `h` pixels high, on the
+/// slider's scale: the rows of the view lie within the slider, so the
+/// overview ruler marks a visible change inside it.
+pub fn track_y(h: u32, rows: u64, page: u64, min: u32, row: u64) -> u32 {
+    let last = rows.max(1) - 1;
+    let h = u64::from(h);
+    let y = match last {
+        0 => row * h / page.max(1),
+        _ => (h - slider_size(h, last, page, min)) * row / last,
+    };
+    y.min(h) as u32
 }
 
 /// Full text rows of a layout (at least one).
@@ -2310,6 +2332,32 @@ mod tests {
             );
             assert!(list.fills.contains(&Fill { rect: top, color }));
         }
+    }
+
+    /// The overview ruler's scale keeps the rows of every view within the
+    /// slider, also when rounding or the least height change its size.
+    #[test]
+    fn track_y_maps_the_rows_in_view_within_the_slider() {
+        for (h, rows, page, min) in [
+            (540, 200, 27, 20),
+            (500, 26, 26, 20),
+            (460, 6, 23, 20),
+            (97, 13, 5, 3),
+            (300, 100_000, 14, 20),
+        ] {
+            let size = slider_size(u64::from(h), rows - 1, page, min) as u32;
+            for top in (0..rows).step_by((rows / 4000).max(1) as usize) {
+                let start = track_y(h, rows, page, min, top);
+                let end = track_y(h, rows, page, min, top + page);
+                assert!(
+                    end <= start + size,
+                    "h {h}, rows {rows}, page {page}, top {top}: {start}..{end} past {size}"
+                );
+            }
+        }
+        // One row takes its share of the track below the top.
+        assert_eq!(track_y(500, 1, 25, 20, 0), 0);
+        assert_eq!(track_y(500, 1, 25, 20, 1), 20);
     }
 
     #[test]

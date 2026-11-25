@@ -58,8 +58,8 @@ it.
   lines face each other; a change takes the rows of its longer side, and the
   other side shows hatched filler rows. A line wider than the view adds a
   horizontal slider at the bottom of each pane.
-- **Divider:** `→` and `←` on the first row of each change copy it to the
-  right or to the left with a click.
+- **Divider:** `→` and `←` on the first visible row of each change copy it
+  to the right or to the left with a click.
 - **Overview ruler:** the changes of the whole comparison at the right edge,
   over the scroll slider.
 - **Status line:** the comparison (`3 changes`, `Comparing…`, `Identical`)

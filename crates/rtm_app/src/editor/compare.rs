@@ -148,6 +148,10 @@ pub(super) struct WaitingCopy {
     pub selections: Selections,
 }
 
+/// What overview marks depend on: the comparison's version, the rows, the
+/// track height, the page and the least slider height.
+type MarksKey = (u64, u64, u32, u64, u32);
+
 /// The session's comparison.
 pub(super) struct Compare {
     thread: DiffThread,
@@ -163,8 +167,8 @@ pub(super) struct Compare {
     alignment: Alignment,
     /// Grows when what the panes draw of the comparison changes.
     version: u64,
-    /// Overview marks for (version, rows, track height).
-    marks: (Option<(u64, u64, u32)>, Vec<Mark>),
+    /// Overview marks and what they were computed for.
+    marks: (Option<MarksKey>, Vec<Mark>),
     /// The current change (WinMerge's current difference) when reached by
     /// Next / Previous Change or a click: a hunk index, kept through edits
     /// and re-diffs.
@@ -801,21 +805,23 @@ impl Editor {
         })
     }
 
-    /// Computes the overview ruler's marks for a track `height` pixels high:
-    /// the rows of each change, left changes in the left half and right
-    /// changes in the right half, at least two pixels high. Kept while the
-    /// diff, the rows and the height stay.
-    pub(super) fn refresh_marks(&mut self, height: u32) {
-        let key = (self.compare.version, self.compare.alignment.rows(), height);
+    /// Computes the overview ruler's marks for a track `height` pixels high
+    /// and a view of `page` rows, on the slider's scale (`min`: its least
+    /// height): the rows of each change, left changes in the left half and
+    /// right changes in the right half, at least two pixels high. Kept while
+    /// the diff, the rows and the scale stay.
+    pub(super) fn refresh_marks(&mut self, height: u32, page: u64, min: u32) {
+        let rows = self.compare.alignment.rows();
+        let key = (self.compare.version, rows, height, page, min);
         if self.compare.marks.0 != Some(key) {
             let alignment = &self.compare.alignment;
-            let rows = alignment.rows().max(1);
+            let y = |row| u64::from(rtm_view::track_y(height, rows, page, min, row));
             let h = u64::from(height);
             let mut sides = vec![0u8; height as usize];
             for (i, hunk) in alignment.hunks().iter().enumerate() {
                 let r = alignment.hunk_rows(i);
-                let top = (r.start * h / rows).min(h.saturating_sub(1));
-                let bottom = (r.end * h / rows).max(top + 2).min(h);
+                let top = y(r.start).min(h.saturating_sub(1));
+                let bottom = y(r.end).max(top + 2).min(h);
                 let bits = u8::from(!hunk.left.is_empty()) | u8::from(!hunk.right.is_empty()) << 1;
                 for side in &mut sides[top as usize..bottom as usize] {
                     *side |= bits;

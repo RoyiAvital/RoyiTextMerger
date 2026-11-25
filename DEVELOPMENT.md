@@ -161,6 +161,23 @@ embedded manifest. `package` builds the release, runs that check and writes
 the executable, `Fonts`, `README.md` and `CHANGELOG.md`; only the ZIP filename
 includes the version and platform. It prints the archive path last.
 
+#### Comparison Fixtures
+
+The comparison is checked against the diff fixtures of VS Code (MIT), not
+against fixtures of our own:
+[`src/vs/editor/test/node/diffing/fixtures`](https://github.com/microsoft/vscode/tree/main/src/vs/editor/test/node/diffing/fixtures).
+Each case is a folder with a pair (`1.tst`, `2.tst`) and VS Code's results
+(`advanced.expected.diff.json`). The fixtures are not copied into the
+repository.
+
+Run them on request and after changes to `rtm_diff`: compare each pair with
+`rtm_diff` and review the hunks, the aligned rows and the inner changes
+against VS Code's results. A different result is not necessarily wrong;
+judge it by readability. The slider heuristic can also be checked against
+the human-rated corpus of
+[`mhagger/diff-slider-tools`](https://github.com/mhagger/diff-slider-tools)
+(no license: reference only, not copied).
+
 ### Releasing
 
 Releases are built by the `Release` GitHub Actions workflow

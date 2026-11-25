@@ -46,6 +46,9 @@ shows it.
 | `Ctrl+Alt+Right`; `Ctrl+Alt+Left` | The same, then go to the next change       |
 | Click `→` or `←` in the divider   | Copy that change to the right; to the left |
 
+The divider shows the arrows on the first visible row of each change, so a
+change taller than the view keeps them while it is scrolled.
+
 A copy replaces the target file's lines of a change with the source file's
 lines. It acts on the changes the focused pane's carets and selections touch
 (a selection also takes the changes between its lines), otherwise on the

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The overview ruler marks the changes on the scroll slider's scale (as VS
+  Code): a change shown in the view is marked within the slider, and the
+  marks of a text shorter than the view no longer spread over the whole
+  ruler.
+- The divider's copy arrows stay on a change scrolled past its first row:
+  they move to its first visible row, so a change taller than the view can
+  be copied with a click from anywhere inside it.
+
 ## [0.1.2] - 2026-11-15
 
 ### Fixed

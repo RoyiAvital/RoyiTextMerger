@@ -12,6 +12,7 @@
 ## Bugs
 
 - [x] Mouse dragging for scroll bars is overridden by the resize arrow.
+- [x] Match the scroll bar logic of `RoyiTextEditor`.
 
 ## Performance
 
